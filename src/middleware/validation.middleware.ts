@@ -47,6 +47,39 @@ export const validateProject: ValidationChain[] = [
     .optional()
     .isFloat({ min: 0 })
     .withMessage('Time consumption must be a non-negative number'),
+  body('todos')
+    .optional()
+    .isArray()
+    .withMessage('Todos must be an array'),
+  body('todos.*.text')
+    .optional()
+    .isString()
+    .withMessage('Todo text must be a string'),
+  body('todos.*.done')
+    .optional()
+    .isBoolean()
+    .withMessage('Todo done must be a boolean'),
+  body('todos.*.children')
+    .optional()
+    .isArray()
+    .withMessage('Todo children must be an array'),
+  body('monetizationPlan')
+    .optional()
+    .isString()
+    .trim()
+    .isLength({ max: 5000 })
+    .withMessage('Monetization plan must be at most 5000 characters'),
+  body('schedule')
+    .optional()
+    .isObject()
+    .withMessage('Schedule must be an object'),
+  body('schedule.monday').optional().isFloat({ min: 0, max: 24 }),
+  body('schedule.tuesday').optional().isFloat({ min: 0, max: 24 }),
+  body('schedule.wednesday').optional().isFloat({ min: 0, max: 24 }),
+  body('schedule.thursday').optional().isFloat({ min: 0, max: 24 }),
+  body('schedule.friday').optional().isFloat({ min: 0, max: 24 }),
+  body('schedule.saturday').optional().isFloat({ min: 0, max: 24 }),
+  body('schedule.sunday').optional().isFloat({ min: 0, max: 24 }),
 ];
 
 export const validateCreateProject: ValidationChain[] = [

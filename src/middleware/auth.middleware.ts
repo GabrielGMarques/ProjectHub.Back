@@ -4,6 +4,7 @@ import { config } from '../config';
 
 export interface AuthRequest extends Request {
   userId?: string;
+  file?: Express.Multer.File;
 }
 
 export function authMiddleware(req: AuthRequest, res: Response, next: NextFunction): void {

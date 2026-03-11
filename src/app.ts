@@ -7,6 +7,8 @@ import projectRoutes from './routes/project.routes';
 import authRoutes from './routes/auth.routes';
 import githubRoutes from './routes/github.routes';
 import analyticsRoutes from './routes/analytics.routes';
+import skillRoutes from './routes/skill.routes';
+import claudeCodeRoutes from './routes/claude-code.routes';
 
 const app = express();
 
@@ -23,6 +25,8 @@ app.use('/api/projects', projectRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/github', githubRoutes);
 app.use('/api/analytics', analyticsRoutes);
+app.use('/api/skills', skillRoutes);
+app.use('/api/claude-code', claudeCodeRoutes);
 
 // Health check
 app.get('/api/health', (_req, res) => {
