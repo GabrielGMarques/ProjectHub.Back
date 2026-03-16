@@ -32,6 +32,12 @@ router.put('/:id', validateProject, (req: any, res: any) => controller.update(re
 router.patch('/:id', validateProject, (req: any, res: any) => controller.update(req, res));
 router.delete('/:id', (req, res) => controller.delete(req, res));
 
+// File explorer routes
+router.get('/:id/files/list', (req: any, res: any) => controller.listFiles(req, res));
+router.get('/:id/files/read', (req: any, res: any) => controller.readFile(req, res));
+router.post('/:id/files/write', (req: any, res: any) => controller.writeFile(req, res));
+router.post('/:id/files/open-in-explorer', (req: any, res: any) => controller.openInExplorer(req, res));
+
 // Document routes
 router.post('/:id/documents', upload.single('file'), (req: any, res: any) => controller.uploadDocument(req, res));
 router.get('/:id/documents/:docId/download', (req: any, res: any) => controller.downloadDocument(req, res));
@@ -39,6 +45,8 @@ router.delete('/:id/documents/:docId', (req: any, res: any) => controller.delete
 
 // AI coaching
 router.post('/:id/ai/coach', (req: any, res: any) => controller.aiCoach(req, res));
+router.put('/:id/ai/coach/messages', (req: any, res: any) => controller.saveCoachMessages(req, res));
+router.delete('/:id/ai/coach/messages', (req: any, res: any) => controller.clearCoachMessages(req, res));
 
 // Marketing research
 router.post('/:id/marketing/research', (req: any, res: any) => marketingController.runFullResearch(req, res));
@@ -48,5 +56,7 @@ router.get('/:id/marketing/latest', (req: any, res: any) => marketingController.
 // Claude Code agent
 router.post('/:id/agent/run', (req: any, res: any) => claudeCodeController.runAgent(req, res));
 router.post('/:id/agent/cancel', (req: any, res: any) => claudeCodeController.cancelAgent(req, res));
+router.get('/:id/agent/sessions', (req: any, res: any) => claudeCodeController.getSessions(req, res));
+router.get('/:id/agent/sessions/:sessionId', (req: any, res: any) => claudeCodeController.getSession(req, res));
 
 export default router;

@@ -73,13 +73,40 @@ export interface IAgentStep {
   completedAt?: Date;
 }
 
+export interface IAgentEvent {
+  type: 'start' | 'text' | 'tool_use' | 'tool_result' | 'error' | 'done';
+  content?: string;
+  tool?: string;
+  sessionId: string;
+  timestamp: Date;
+}
+
 export interface IAgentSession {
   sessionId: string;
+  sdkSessionId?: string;
   type: 'marketing-research' | 'claude-code' | 'skill';
   status: 'running' | 'completed' | 'failed' | 'cancelled';
+  prompt?: string;
+  events?: IAgentEvent[];
   steps: IAgentStep[];
   createdAt: Date;
   completedAt?: Date;
+}
+
+export interface ICoachAction {
+  type: 'add_todos' | 'update_presentation' | 'update_field';
+  items?: string[];
+  content?: string;
+  field?: string;
+  value?: string;
+  status: 'pending' | 'accepted' | 'rejected';
+}
+
+export interface ICoachMessage {
+  role: 'user' | 'assistant';
+  content: string;
+  actions?: ICoachAction[];
+  timestamp: Date;
 }
 
 export interface IProject extends Document {
@@ -94,6 +121,8 @@ export interface IProject extends Document {
   impact: 'low' | 'medium' | 'high';
   niche: string;
   timeConsumption: number;
+  timeSpent: number;
+  timeSpentPerDay: IWeeklySchedule;
   todos: ITodo[];
   presentation: string;
   monetizationPlan: string;
@@ -101,6 +130,7 @@ export interface IProject extends Document {
   documents: IDocument[];
   marketingResearch: IMarketingResearch;
   agentSessions: IAgentSession[];
+  coachMessages: ICoachMessage[];
   sortOrder: number;
   burndownSortOrder: number;
   createdAt: Date;
@@ -126,6 +156,16 @@ const projectSchema = new Schema<IProject>(
     impact: { type: String, enum: ['low', 'medium', 'high'], default: 'low' },
     niche: { type: String, default: '', trim: true },
     timeConsumption: { type: Number, default: 0, min: 0 },
+    timeSpent: { type: Number, default: 0, min: 0 },
+    timeSpentPerDay: {
+      monday: { type: Number, default: 0, min: 0 },
+      tuesday: { type: Number, default: 0, min: 0 },
+      wednesday: { type: Number, default: 0, min: 0 },
+      thursday: { type: Number, default: 0, min: 0 },
+      friday: { type: Number, default: 0, min: 0 },
+      saturday: { type: Number, default: 0, min: 0 },
+      sunday: { type: Number, default: 0, min: 0 },
+    },
     todos: [todoSchema],
     presentation: { type: String, default: '' },
     monetizationPlan: { type: String, default: '', trim: true },
@@ -163,11 +203,27 @@ const projectSchema = new Schema<IProject>(
     },
     agentSessions: [{
       sessionId: String,
+      sdkSessionId: String,
       type: { type: String, enum: ['marketing-research', 'claude-code', 'skill'] },
       status: { type: String, enum: ['running', 'completed', 'failed', 'cancelled'] },
+      prompt: String,
+      events: [{ type: { type: String }, content: String, tool: String, sessionId: String, timestamp: Date }],
       steps: [{ name: String, status: { type: String, enum: ['pending', 'running', 'completed', 'failed'] }, result: String, startedAt: Date, completedAt: Date }],
       createdAt: { type: Date, default: Date.now },
       completedAt: Date,
+    }],
+    coachMessages: [{
+      role: { type: String, enum: ['user', 'assistant'] },
+      content: String,
+      actions: [{
+        type: { type: String, enum: ['add_todos', 'update_presentation', 'update_field'] },
+        items: [String],
+        content: String,
+        field: String,
+        value: String,
+        status: { type: String, enum: ['pending', 'accepted', 'rejected'], default: 'pending' },
+      }],
+      timestamp: { type: Date, default: Date.now },
     }],
     sortOrder: { type: Number, default: 0 },
     burndownSortOrder: { type: Number, default: -1 },

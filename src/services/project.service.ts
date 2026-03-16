@@ -28,6 +28,11 @@ export class ProjectService {
       data.timeConsumption = (s.monday || 0) + (s.tuesday || 0) + (s.wednesday || 0)
         + (s.thursday || 0) + (s.friday || 0) + (s.saturday || 0) + (s.sunday || 0);
     }
+    if (data.timeSpentPerDay) {
+      const s = data.timeSpentPerDay;
+      data.timeSpent = (s.monday || 0) + (s.tuesday || 0) + (s.wednesday || 0)
+        + (s.thursday || 0) + (s.friday || 0) + (s.saturday || 0) + (s.sunday || 0);
+    }
     return Project.findOneAndUpdate(
       { _id: id, userId: new Types.ObjectId(userId) },
       { $set: data },

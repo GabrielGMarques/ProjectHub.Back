@@ -157,7 +157,34 @@ ${project.monetizationPlan || 'Not set'}`;
       prompt += docTexts.join('\n\n');
     }
 
-    prompt += '\n\nUse the above context to provide relevant, actionable coaching advice. Reference specific details from the project and documents when applicable.';
+    prompt += `\n\nACTIONS:
+You can suggest concrete changes to the project by including action blocks in your response. Use this exact format:
+
+\`\`\`coach-action
+{"type": "add_todos", "items": ["Task 1", "Task 2"]}
+\`\`\`
+
+\`\`\`coach-action
+{"type": "update_presentation", "content": "Full new presentation markdown content here"}
+\`\`\`
+
+\`\`\`coach-action
+{"type": "update_field", "field": "description", "value": "New value"}
+\`\`\`
+
+Available action types:
+- add_todos: Add items to the project's TODO list. Use "items" array with string values.
+- update_presentation: Update the project presentation. Use "content" with the full markdown text.
+- update_field: Update a specific project field. Available fields: description, niche, monetizationPlan. Use "field" and "value".
+
+IMPORTANT RULES FOR ACTIONS:
+- Only suggest actions when making a specific, concrete recommendation or when the user asks for changes.
+- Always explain what you're suggesting and why BEFORE the action block.
+- The user will see Apply/Dismiss buttons for each action — nothing happens without their confirmation.
+- Don't use actions for every response — only when there's a real change to propose.
+- You can include multiple action blocks in one response if needed.
+
+Use the above context to provide relevant, actionable coaching advice. Reference specific details from the project and documents when applicable.`;
 
     return prompt;
   }
