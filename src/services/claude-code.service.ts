@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
+import { Project } from '../models/project.model';
 
 export interface ClaudeCodeEvent {
   type: 'start' | 'text' | 'tool_use' | 'tool_result' | 'error' | 'done';
@@ -34,7 +35,8 @@ async function getQuery() {
 export class ClaudeCodeService {
   isAvailable: boolean = false;
 
-  private activeSessions: Map<string, { close: () => void }> = new Map();
+  private activeSessions: Map<string, { close: () => void; projectId?: string; startedAt: Date }> = new Map();
+  private cleanupInterval: ReturnType<typeof setInterval> | null = null;
 
   async checkAvailability(): Promise<{ available: boolean; version: string }> {
     // SDK uses Claude Code OAuth subscription, not ANTHROPIC_API_KEY
@@ -53,11 +55,11 @@ export class ClaudeCodeService {
     projectPath: string,
     prompt: string,
     onEvent: (event: ClaudeCodeEvent) => void,
-    options?: { resumeSdkSessionId?: string },
+    options?: { resumeSdkSessionId?: string; allowedTools?: string[] },
     timeoutMs: number = DEFAULT_TIMEOUT_MS
   ): Promise<RunCommandResult> {
-    // Validate project path
-    const resolvedPath = path.resolve(projectPath);
+    // Validate project path — normalize to forward slashes for the SDK
+    const resolvedPath = path.resolve(projectPath).replace(/\\/g, '/');
     let stat: fs.Stats;
     try {
       stat = fs.statSync(resolvedPath);
@@ -98,7 +100,7 @@ export class ClaudeCodeService {
       delete sdkEnv.ANTHROPIC_API_KEY;
 
       const queryOptions: any = {
-        allowedTools: ['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep'],
+        allowedTools: options?.allowedTools?.length ? options.allowedTools : ['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep'],
         cwd: resolvedPath,
         maxTurns: 50,
         env: sdkEnv,
@@ -115,7 +117,7 @@ export class ClaudeCodeService {
       });
 
       // Store reference so we can close it on cancel
-      this.activeSessions.set(sessionId, conversation);
+      this.activeSessions.set(sessionId, { close: () => conversation.close(), projectId: undefined, startedAt: new Date() });
 
       for await (const message of conversation) {
         // Capture SDK session ID from the first message
@@ -158,6 +160,63 @@ export class ClaudeCodeService {
     session.close();
     this.activeSessions.delete(sessionId);
     return true;
+  }
+
+  /** Get all currently running sessions */
+  getActiveSessions(): { sessionId: string; projectId?: string; startedAt: Date }[] {
+    return Array.from(this.activeSessions.entries()).map(([sessionId, s]) => ({
+      sessionId,
+      projectId: s.projectId,
+      startedAt: s.startedAt,
+    }));
+  }
+
+  /** Stop all running sessions */
+  stopAllSessions(): number {
+    let count = 0;
+    for (const [sessionId, session] of this.activeSessions) {
+      try { session.close(); } catch {}
+      this.activeSessions.delete(sessionId);
+      count++;
+    }
+    return count;
+  }
+
+  /** Mark stale "running" sessions in DB as cancelled (for crash recovery) */
+  async cleanupStaleSessions(): Promise<number> {
+    try {
+      const result = await Project.updateMany(
+        { 'agentSessions.status': 'running' },
+        { $set: { 'agentSessions.$[elem].status': 'cancelled', 'agentSessions.$[elem].completedAt': new Date() } },
+        { arrayFilters: [{ 'elem.status': 'running' }] }
+      );
+      return result.modifiedCount || 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /** Start periodic cleanup of timed-out sessions */
+  startCleanupRoutine(intervalMs: number = 5 * 60 * 1000): void {
+    if (this.cleanupInterval) return;
+    this.cleanupInterval = setInterval(() => {
+      const now = Date.now();
+      for (const [sessionId, session] of this.activeSessions) {
+        const elapsed = now - session.startedAt.getTime();
+        if (elapsed > DEFAULT_TIMEOUT_MS) {
+          console.log(`[ClaudeCode] Stopping timed-out session: ${sessionId}`);
+          try { session.close(); } catch {}
+          this.activeSessions.delete(sessionId);
+        }
+      }
+    }, intervalMs);
+  }
+
+  stopCleanupRoutine(): void {
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = null;
+    }
   }
 
   private processMessage(

@@ -2,10 +2,12 @@ import { Response } from 'express';
 import { AuthRequest } from '../middleware/auth.middleware';
 import { ProjectService } from '../services/project.service';
 import { ClaudeCodeService } from '../services/claude-code.service';
+import { TelemetryService } from '../services/telemetry.service';
 import { Project } from '../models/project.model';
 
 const projectService = new ProjectService();
 const claudeCodeService = new ClaudeCodeService();
+const telemetryService = new TelemetryService();
 
 export class ClaudeCodeController {
   async getStatus(_req: AuthRequest, res: Response): Promise<void> {
@@ -21,9 +23,11 @@ export class ClaudeCodeController {
     const project = await projectService.findById(req.params.id, req.userId!);
     if (!project) { res.status(404).json({ error: 'Project not found' }); return; }
 
-    const projectPath = project.localPath;
+    const allFolders = [...(project.folders || [])];
+    if (project.localPath && !allFolders.includes(project.localPath)) allFolders.unshift(project.localPath);
+    const projectPath = allFolders[0];
     if (!projectPath) {
-      res.status(400).json({ error: 'Project has no local path configured. Set localPath in project settings.' });
+      res.status(400).json({ error: 'Project has no folders configured. Add folders in project settings.' });
       return;
     }
 
@@ -47,7 +51,13 @@ export class ClaudeCodeController {
       ctx.push(`Project: ${project.name}`);
       if (project.description) ctx.push(`Description: ${project.description}`);
       if (project.niche) ctx.push(`Niche: ${project.niche}`);
-      if (project.localPath) ctx.push(`Local Path: ${project.localPath}`);
+      if (allFolders.length) {
+        ctx.push(`Working Directory (cwd): ${allFolders[0]}`);
+        if (allFolders.length > 1) {
+          ctx.push(`Project Folders (you have access to all of these):`);
+          allFolders.forEach((p: string) => ctx.push(`  - ${p}`));
+        }
+      }
       if (project.githubRepos?.length) ctx.push(`GitHub Repos: ${project.githubRepos.join(', ')}`);
       if (project.mrr) ctx.push(`MRR: $${project.mrr}`);
       if (project.clientCount) ctx.push(`Clients: ${project.clientCount}`);
@@ -135,19 +145,34 @@ export class ClaudeCodeController {
       }
     });
 
+    const startTime = Date.now();
+    telemetryService.track({
+      userId: req.userId!, projectId: req.params.id,
+      type: 'agent_run', source: 'claude-code', status: 'started',
+      description: prompt.substring(0, 200),
+    });
+
     try {
       const result = await claudeCodeService.runCommand(
         projectPath,
         fullPrompt,
         (event) => {
           if (event.sessionId) activeSessionId = event.sessionId;
-          // Don't write to a closed connection
           if (!clientDisconnected && !res.writableEnded) {
             res.write(`data: ${JSON.stringify(event)}\n\n`);
           }
         },
         { resumeSdkSessionId },
       );
+
+      telemetryService.track({
+        userId: req.userId!, projectId: req.params.id,
+        type: 'agent_run', source: 'claude-code',
+        status: result.status === 'completed' ? 'completed' : 'failed',
+        description: prompt.substring(0, 200),
+        durationMs: Date.now() - startTime,
+        error: result.status !== 'completed' ? result.status : undefined,
+      });
 
       // Save session to project (fire-and-forget)
       Project.findByIdAndUpdate(req.params.id, {
@@ -166,6 +191,12 @@ export class ClaudeCodeController {
         },
       }).catch(() => {});
     } catch (error: any) {
+      telemetryService.track({
+        userId: req.userId!, projectId: req.params.id,
+        type: 'error', source: 'claude-code', status: 'failed',
+        description: prompt.substring(0, 200),
+        error: error.message, durationMs: Date.now() - startTime,
+      });
       if (!clientDisconnected && !res.writableEnded) {
         res.write(`data: ${JSON.stringify({ type: 'error', content: error.message, sessionId: '', timestamp: new Date() })}\n\n`);
       }
@@ -211,5 +242,17 @@ export class ClaudeCodeController {
     if (!sessionId) { res.status(400).json({ error: 'sessionId is required' }); return; }
     claudeCodeService.cancelSession(sessionId);
     res.json({ message: 'Session cancelled' });
+  }
+
+  async getActiveSessions(_req: AuthRequest, res: Response): Promise<void> {
+    const sessions = claudeCodeService.getActiveSessions();
+    res.json(sessions);
+  }
+
+  async stopAllSessions(_req: AuthRequest, res: Response): Promise<void> {
+    const count = claudeCodeService.stopAllSessions();
+    // Also mark in DB
+    const dbCleaned = await claudeCodeService.cleanupStaleSessions();
+    res.json({ message: `Stopped ${count} active sessions, cleaned ${dbCleaned} DB records` });
   }
 }

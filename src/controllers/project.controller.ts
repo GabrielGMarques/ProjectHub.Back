@@ -215,19 +215,69 @@ export class ProjectController {
     }
   }
 
+  async pickFolder(_req: AuthRequest, res: Response): Promise<void> {
+    try {
+      let cmd: string;
+      switch (process.platform) {
+        case 'win32':
+          cmd = `powershell -NoProfile -Command "Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = 'Select a project folder'; $d.RootFolder = 'MyComputer'; if ($d.ShowDialog() -eq 'OK') { Write-Output $d.SelectedPath } else { Write-Output '' }"`;
+          break;
+        case 'darwin':
+          cmd = `osascript -e 'POSIX path of (choose folder with prompt "Select a project folder")'`;
+          break;
+        default:
+          cmd = `zenity --file-selection --directory --title="Select a project folder" 2>/dev/null || kdialog --getexistingdirectory ~ 2>/dev/null`;
+          break;
+      }
+
+      exec(cmd, { timeout: 120000 }, (error, stdout) => {
+        const selected = (stdout || '').trim();
+        if (error || !selected) {
+          res.json({ path: '' });
+        } else {
+          res.json({ path: selected });
+        }
+      });
+    } catch {
+      res.json({ path: '' });
+    }
+  }
+
+  /** Get all valid folders for this project (folders[] + legacy localPath). */
+  private getAllFolders(project: any): string[] {
+    const folders = [...(project.folders || [])];
+    // Backward compat: include legacy localPath if not already in folders
+    if (project.localPath && !folders.includes(project.localPath)) {
+      folders.unshift(project.localPath);
+    }
+    return folders.filter(Boolean);
+  }
+
+  /** Resolve the effective root path from `root` param or default to first folder. Validates against allowed paths. */
+  private resolveRoot(project: any, rootParam?: string): string | null {
+    const allFolders = this.getAllFolders(project);
+    if (!allFolders.length) return null;
+    if (!rootParam) return allFolders[0];
+    const resolved = path.resolve(rootParam);
+    if (allFolders.some((p: string) => path.resolve(p) === resolved)) return resolved;
+    return null; // not allowed
+  }
+
   async listFiles(req: AuthRequest, res: Response): Promise<void> {
     try {
       const project = await projectService.findById(req.params.id, req.userId!);
       if (!project) { res.status(404).json({ error: 'Project not found' }); return; }
-      if (!project.localPath) { res.status(400).json({ error: 'Project has no local path configured' }); return; }
+
+      const rootPath = this.resolveRoot(project, req.query.root as string);
+      if (!rootPath) { res.status(400).json({ error: 'No valid root path configured' }); return; }
 
       const relativePath = (req.query.path as string) || '';
       const targetPath = relativePath
-        ? path.resolve(project.localPath, relativePath)
-        : project.localPath;
+        ? path.resolve(rootPath, relativePath)
+        : rootPath;
 
-      // Prevent path traversal outside project root
-      if (!targetPath.startsWith(path.resolve(project.localPath))) {
+      // Prevent path traversal outside root
+      if (!targetPath.startsWith(path.resolve(rootPath))) {
         res.status(403).json({ error: 'Access denied: path outside project directory' });
         return;
       }
@@ -253,7 +303,7 @@ export class ProjectController {
 
         try {
           const itemPath = path.join(targetPath, item.name);
-          const rel = path.relative(project.localPath, itemPath).replace(/\\/g, '/');
+          const rel = path.relative(rootPath, itemPath).replace(/\\/g, '/');
           if (item.isDirectory()) {
             entries.push({ name: item.name, path: rel, isDir: true });
           } else {
@@ -269,7 +319,7 @@ export class ProjectController {
         return a.name.localeCompare(b.name);
       });
 
-      const rel = path.relative(project.localPath, targetPath).replace(/\\/g, '/');
+      const rel = path.relative(rootPath, targetPath).replace(/\\/g, '/');
       res.json({
         current: rel || '',
         parent: rel ? path.dirname(rel).replace(/\\/g, '/') : null,
@@ -284,13 +334,15 @@ export class ProjectController {
     try {
       const project = await projectService.findById(req.params.id, req.userId!);
       if (!project) { res.status(404).json({ error: 'Project not found' }); return; }
-      if (!project.localPath) { res.status(400).json({ error: 'Project has no local path configured' }); return; }
+
+      const rootPath = this.resolveRoot(project, req.query.root as string);
+      if (!rootPath) { res.status(400).json({ error: 'No valid root path configured' }); return; }
 
       const relativePath = req.query.path as string;
       if (!relativePath) { res.status(400).json({ error: 'path query parameter is required' }); return; }
 
-      const targetPath = path.resolve(project.localPath, relativePath);
-      if (!targetPath.startsWith(path.resolve(project.localPath))) {
+      const targetPath = path.resolve(rootPath, relativePath);
+      if (!targetPath.startsWith(path.resolve(rootPath))) {
         res.status(403).json({ error: 'Access denied: path outside project directory' });
         return;
       }
@@ -319,7 +371,9 @@ export class ProjectController {
     try {
       const project = await projectService.findById(req.params.id, req.userId!);
       if (!project) { res.status(404).json({ error: 'Project not found' }); return; }
-      if (!project.localPath) { res.status(400).json({ error: 'Project has no local path configured' }); return; }
+
+      const rootPath = this.resolveRoot(project, req.body.root);
+      if (!rootPath) { res.status(400).json({ error: 'No valid root path configured' }); return; }
 
       const { path: filePath, content } = req.body;
       if (!filePath || typeof content !== 'string') {
@@ -327,8 +381,8 @@ export class ProjectController {
         return;
       }
 
-      const targetPath = path.resolve(project.localPath, filePath);
-      if (!targetPath.startsWith(path.resolve(project.localPath))) {
+      const targetPath = path.resolve(rootPath, filePath);
+      if (!targetPath.startsWith(path.resolve(rootPath))) {
         res.status(403).json({ error: 'Access denied: path outside project directory' });
         return;
       }
@@ -346,14 +400,16 @@ export class ProjectController {
     try {
       const project = await projectService.findById(req.params.id, req.userId!);
       if (!project) { res.status(404).json({ error: 'Project not found' }); return; }
-      if (!project.localPath) { res.status(400).json({ error: 'Project has no local path configured' }); return; }
+
+      const rootPath = this.resolveRoot(project, req.body.root);
+      if (!rootPath) { res.status(400).json({ error: 'No valid root path configured' }); return; }
 
       const relativePath = (req.body.path as string) || '';
       const targetPath = relativePath
-        ? path.resolve(project.localPath, relativePath)
-        : project.localPath;
+        ? path.resolve(rootPath, relativePath)
+        : rootPath;
 
-      if (!targetPath.startsWith(path.resolve(project.localPath))) {
+      if (!targetPath.startsWith(path.resolve(rootPath))) {
         res.status(403).json({ error: 'Access denied: path outside project directory' });
         return;
       }
@@ -388,7 +444,7 @@ export class ProjectController {
   }
 
   async getAvailableModels(_req: AuthRequest, res: Response): Promise<void> {
-    res.json(aiService.getAvailableModels());
+    res.json(await aiService.getAvailableModels());
   }
 
   async aiCoach(req: AuthRequest, res: Response): Promise<void> {

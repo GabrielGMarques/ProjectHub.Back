@@ -25,6 +25,7 @@ router.post(
 router.put('/reorder', (req: any, res: any) => controller.reorder(req, res));
 router.get('/ai/models', (req: any, res: any) => controller.getAvailableModels(req, res));
 router.get('/browse-folders', (req: any, res: any) => controller.browseFolders(req, res));
+router.post('/pick-folder', (req: any, res: any) => controller.pickFolder(req, res));
 
 // Parameterized routes
 router.get('/:id', (req, res) => controller.getById(req, res));

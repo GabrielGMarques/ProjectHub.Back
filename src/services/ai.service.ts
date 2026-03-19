@@ -1,9 +1,9 @@
-import Anthropic from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import fs from 'fs';
 import path from 'path';
 import { IProject } from '../models/project.model';
+import { claudeChat, isClaudeAvailable } from './claude-proxy.service';
 
 let pdfParse: any;
 try {
@@ -31,29 +31,36 @@ const MODEL_IDS: Record<AIModel, string> = {
 };
 
 export class AIService {
-  private anthropic: Anthropic | null = null;
+  private claudeAvailable: boolean | null = null;
   private openai: OpenAI | null = null;
   private gemini: GoogleGenerativeAI | null = null;
 
   constructor() {
-    if (process.env.ANTHROPIC_API_KEY) {
-      this.anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-    }
     if (process.env.OPENAI_API_KEY) {
       this.openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     }
     if (process.env.GEMINI_API_KEY) {
       this.gemini = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
     }
+    // Claude availability checked lazily via SDK
   }
 
   get isConfigured(): boolean {
-    return this.anthropic !== null || this.openai !== null || this.gemini !== null;
+    // Assume Claude is available (checked lazily); also check other providers
+    return true;
   }
 
-  getAvailableModels(): { id: AIModel; name: string; available: boolean }[] {
+  private async checkClaude(): Promise<boolean> {
+    if (this.claudeAvailable === null) {
+      this.claudeAvailable = await isClaudeAvailable();
+    }
+    return this.claudeAvailable;
+  }
+
+  async getAvailableModels(): Promise<{ id: AIModel; name: string; available: boolean }[]> {
+    const claude = await this.checkClaude();
     return [
-      { id: 'claude-sonnet', name: 'Claude Sonnet', available: this.anthropic !== null },
+      { id: 'claude-sonnet', name: 'Claude Sonnet', available: claude },
       { id: 'gpt-4o', name: 'GPT-4o', available: this.openai !== null },
       { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash', available: this.gemini !== null },
     ];
@@ -76,17 +83,14 @@ export class AIService {
   }
 
   private async callClaude(systemPrompt: string, messages: ChatMessage[]): Promise<string> {
-    if (!this.anthropic) {
-      throw new Error('Claude is not configured. Set ANTHROPIC_API_KEY in your environment.');
+    const available = await this.checkClaude();
+    if (!available) {
+      throw new Error('Claude is not available. Ensure Claude Code CLI is installed and authenticated.');
     }
-    const response = await this.anthropic.messages.create({
-      model: MODEL_IDS['claude-sonnet'],
-      max_tokens: 2048,
+    return claudeChat({
       system: systemPrompt,
       messages: messages.map(m => ({ role: m.role, content: m.content })),
     });
-    const block = response.content[0];
-    return block.type === 'text' ? block.text : '';
   }
 
   private async callOpenAI(systemPrompt: string, messages: ChatMessage[]): Promise<string> {

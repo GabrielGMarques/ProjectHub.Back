@@ -115,7 +115,9 @@ export interface IProject extends Document {
   description: string;
   backgroundImage: string;
   githubRepos: string[];
+  /** @deprecated Use folders[0] instead */
   localPath: string;
+  folders: string[];
   mrr: number;
   clientCount: number;
   impact: 'low' | 'medium' | 'high';
@@ -151,6 +153,7 @@ const projectSchema = new Schema<IProject>(
     backgroundImage: { type: String, default: '' },
     githubRepos: [{ type: String }],
     localPath: { type: String, default: '' },
+    folders: [{ type: String }],
     mrr: { type: Number, default: 0, min: 0 },
     clientCount: { type: Number, default: 0, min: 0 },
     impact: { type: String, enum: ['low', 'medium', 'high'], default: 'low' },
