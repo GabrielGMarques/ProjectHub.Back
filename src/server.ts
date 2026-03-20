@@ -89,7 +89,30 @@ async function startServer(): Promise<void> {
         return '';
       }
 
-      // Everything goes to the AI Manager — natural language
+      // Direct commands — no AI needed
+      if (cmd === '/alfred-restart' || cmd === '/restart') {
+        managerService.restart();
+        return `🔄 Alfred restarted (loop: ${managerService.getLoopIntervalDisplay()}). Memory preserved.`;
+      }
+
+      if (cmd === '/alfred-interval' || cmd === '/interval') {
+        const hours = parseFloat(args) || 0;
+        if (!hours || hours < 0.01 || hours > 24) return '⚠️ Usage: /alfred-interval H.MM\n0.05 = 5min, 0.15 = 15min, 0.30 = 30min, 1 = 1h, 1.30 = 1h30min';
+        managerService.setLoopInterval(hours);
+        return `⏱️ Loop interval → ${managerService.getLoopIntervalDisplay()}`;
+      }
+
+      if (cmd === '/alfred-status') {
+        return `🤖 *Alfred Status*\nRunning: ${managerService.isRunning() ? '✅' : '❌'}\nLoop: ${managerService.getLoopIntervalDisplay()}`;
+      }
+
+      if (cmd === '/delete-alfred-memory') {
+        const result = await managerService.wipeMemory(userId);
+        managerService.restart();
+        return result + '\n\n🔄 Alfred restarted fresh.';
+      }
+
+      // Everything else goes to the AI Manager — natural language
       const message = args ? `${cmd} ${args}`.trim() : cmd;
       return managerService.handleMessage(message, userId);
     };
@@ -98,7 +121,7 @@ async function startServer(): Promise<void> {
     // Only actually start polling if bot token is already configured
     if (telegramService.isConfigured) {
       telegramService.startPolling(telegramCommandHandler);
-      telegramService.send('🚀 *ProjectsHub* is online!\nType /help for commands.').then(ok => {
+      telegramService.send('🚀 *Alfred* is online!\nType /help for commands.').then(ok => {
         if (!ok) console.log('[Telegram] Send /start to the bot in Telegram to connect.');
       });
     } else {

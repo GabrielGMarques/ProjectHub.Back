@@ -1,6 +1,7 @@
 import { Response } from 'express';
 import { AuthRequest } from '../middleware/auth.middleware';
 import { EmployeeService } from '../services/employee.service';
+import { EmployeeLog } from '../models/employee-log.model';
 import { TelemetryService } from '../services/telemetry.service';
 
 const employeeService = new EmployeeService();
@@ -82,6 +83,26 @@ export class EmployeeController {
     if (!res.writableEnded) res.end();
   }
 
+  async stopTask(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const result = await employeeService.stopTask(req.userId!, req.params.id);
+      res.json(result);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+    }
+  }
+
+  async sendMessage(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const { message } = req.body;
+      if (!message) { res.status(400).json({ error: 'message is required' }); return; }
+      const result = await employeeService.sendMessage(req.userId!, req.params.id, message);
+      res.json(result);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+    }
+  }
+
   async getComms(req: AuthRequest, res: Response): Promise<void> {
     const comms = await employeeService.getComms(req.userId!, req.params.projectId);
     res.json(comms);
@@ -112,5 +133,27 @@ export class EmployeeController {
   async getRoleSkills(req: AuthRequest, res: Response): Promise<void> {
     const skills = await employeeService.getRoleSkills(req.userId!, req.params.role);
     res.json(skills);
+  }
+
+  async getLogs(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const { id } = req.params;
+      const page = parseInt(req.query.page as string) || 1;
+      const limit = Math.min(parseInt(req.query.limit as string) || 100, 500);
+      const category = req.query.category as string;
+      const skip = (page - 1) * limit;
+
+      const filter: any = { userId: req.userId!, employeeId: id };
+      if (category) filter.category = category;
+
+      const [logs, total] = await Promise.all([
+        EmployeeLog.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+        EmployeeLog.countDocuments(filter),
+      ]);
+
+      res.json({ logs, total, page, limit, pages: Math.ceil(total / limit) });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
   }
 }

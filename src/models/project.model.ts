@@ -133,6 +133,7 @@ export interface IProject extends Document {
   marketingResearch: IMarketingResearch;
   agentSessions: IAgentSession[];
   coachMessages: ICoachMessage[];
+  onHolding: boolean;
   sortOrder: number;
   burndownSortOrder: number;
   createdAt: Date;
@@ -158,6 +159,7 @@ const projectSchema = new Schema<IProject>(
     clientCount: { type: Number, default: 0, min: 0 },
     impact: { type: String, enum: ['low', 'medium', 'high'], default: 'low' },
     niche: { type: String, default: '', trim: true },
+    onHolding: { type: Boolean, default: false },
     timeConsumption: { type: Number, default: 0, min: 0 },
     timeSpent: { type: Number, default: 0, min: 0 },
     timeSpentPerDay: {

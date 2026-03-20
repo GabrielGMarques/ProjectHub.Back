@@ -23,42 +23,128 @@ export class TelegramService {
 
   // ── Outbound (send) ──
 
+  private static readonly MAX_LEN = 4000; // Telegram limit is 4096, leave margin
+
   async send(message: string): Promise<boolean> {
     if (!this.botToken) return false;
     if (!this.chatId) {
       console.log('[Telegram] No chat ID set. Send /start to the bot in Telegram to connect.');
       return false;
     }
-    const ok = await this.apiCall('sendMessage', {
-      chat_id: this.chatId,
-      text: message,
-      parse_mode: 'Markdown',
-      disable_web_page_preview: true,
-    });
-    if (!ok) {
-      console.log(`[Telegram] Failed to send message to chat ${this.chatId}`);
+
+    // Split into chunks that fit Telegram's limit
+    const chunks = TelegramService.splitMessage(message, TelegramService.MAX_LEN);
+    let allOk = true;
+
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      // Convert standard MD → Telegram Markdown, add part indicator
+      const converted = TelegramService.toTelegramMarkdown(chunk);
+      const text = chunks.length > 1 ? `${converted}\n\n_(${i + 1}/${chunks.length})_` : converted;
+
+      // Try Markdown first
+      let result = await this.apiCallWithResponse('sendMessage', {
+        chat_id: this.chatId,
+        text,
+        parse_mode: 'Markdown',
+        disable_web_page_preview: true,
+      });
+
+      // If Markdown failed (often bad formatting from AI), retry as plain text
+      if (!result.ok) {
+        console.log(`[Telegram] Markdown send failed (${result.errorCode}: ${result.description}), retrying as plain text`);
+        const plainText = TelegramService.stripMarkdown(text);
+        result = await this.apiCallWithResponse('sendMessage', {
+          chat_id: this.chatId,
+          text: plainText,
+          disable_web_page_preview: true,
+        });
+
+        if (!result.ok) {
+          console.log(`[Telegram] Plain text send also failed (${result.errorCode}: ${result.description}), chunk ${i + 1}/${chunks.length}`);
+          allOk = false;
+        }
+      }
+
+      // Small delay between chunks to avoid rate limits
+      if (i < chunks.length - 1) {
+        await new Promise(r => setTimeout(r, 300));
+      }
     }
-    return ok;
+
+    return allOk;
+  }
+
+  /** Split a long message into chunks, breaking at paragraph/line boundaries */
+  private static splitMessage(text: string, maxLen: number): string[] {
+    if (text.length <= maxLen) return [text];
+
+    const chunks: string[] = [];
+    let remaining = text;
+
+    while (remaining.length > 0) {
+      if (remaining.length <= maxLen) {
+        chunks.push(remaining);
+        break;
+      }
+
+      // Try to split at double newline (paragraph)
+      let splitAt = remaining.lastIndexOf('\n\n', maxLen);
+      // Fallback: single newline
+      if (splitAt < maxLen * 0.3) splitAt = remaining.lastIndexOf('\n', maxLen);
+      // Fallback: space
+      if (splitAt < maxLen * 0.3) splitAt = remaining.lastIndexOf(' ', maxLen);
+      // Hard cut as last resort
+      if (splitAt < maxLen * 0.3) splitAt = maxLen;
+
+      chunks.push(remaining.substring(0, splitAt).trimEnd());
+      remaining = remaining.substring(splitAt).trimStart();
+    }
+
+    return chunks.filter(c => c.length > 0);
+  }
+
+  /** Convert standard Markdown to Telegram-compatible Markdown */
+  private static toTelegramMarkdown(text: string): string {
+    return text
+      // **bold** → *bold* (Telegram uses single asterisk for bold)
+      .replace(/\*\*(.+?)\*\*/g, '*$1*')
+      // ## Heading → *Heading* (Telegram has no headings, make bold)
+      .replace(/^#{1,6}\s+(.+)$/gm, '*$1*')
+      // [text](url) → text (url) — Telegram Markdown doesn't support links
+      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)')
+      // --- or === horizontal rules → just dashes
+      .replace(/^[-=]{3,}$/gm, '———');
+  }
+
+  /** Strip Markdown formatting so plain text still reads well */
+  private static stripMarkdown(text: string): string {
+    return text
+      .replace(/\*\*(.*?)\*\*/g, '$1')  // bold **text**
+      .replace(/\*(.*?)\*/g, '$1')       // bold/italic *text*
+      .replace(/_(.*?)_/g, '$1')         // italic _text_
+      .replace(/`([^`]+)`/g, '$1')       // inline code
+      .replace(/```[\s\S]*?```/g, (m) => m.replace(/```\w*\n?/g, '').trim()); // code blocks
   }
 
   async notifyTaskStarted(name: string, project: string, task: string): Promise<void> {
-    await this.send(`🟢 *${name}* started working\n📁 ${project}\n📝 ${task}`);
+    await this.send(`🟢 *${name}* started working\n🏢 ${project}\n📝 ${task}`);
   }
 
   async notifyTaskCompleted(name: string, project: string, task: string): Promise<void> {
-    await this.send(`✅ *${name}* completed\n📁 ${project}\n📝 ${task}`);
+    await this.send(`✅ *${name}* completed\n🏢 ${project}\n📝 ${task}`);
   }
 
   async notifyTaskFailed(name: string, project: string, task: string, err: string): Promise<void> {
-    await this.send(`❌ *${name}* failed\n📁 ${project}\n📝 ${task}\n⚠️ ${err}`);
+    await this.send(`❌ *${name}* failed\n🏢 ${project}\n📝 ${task}\n⚠️ ${err}`);
   }
 
   async notifyHired(name: string, project: string): Promise<void> {
-    await this.send(`🤝 *${name}* hired\n📁 ${project}`);
+    await this.send(`🤝 *${name}* hired\n🏢 ${project}`);
   }
 
   async notifyFired(name: string, project: string): Promise<void> {
-    await this.send(`👋 *${name}* removed\n📁 ${project}`);
+    await this.send(`👋 *${name}* removed\n🏢 ${project}`);
   }
 
   /** Try to discover the chat ID by reading recent messages sent to the bot.
@@ -143,11 +229,25 @@ export class TelegramService {
         this.lastUpdateId = update.update_id;
         const fromChatId = String(update.message?.chat?.id);
 
+        // Handle document/photo messages — download and extract text
+        const doc = update.message?.document;
+        const photo = update.message?.photo;
+        let text: string | undefined = update.message?.text;
+        const caption = update.message?.caption || '';
+
+        if (!text && (doc || photo)) {
+          const result = await this.handleFileMessage(update.message, fromChatId);
+          if (result) {
+            text = result;
+          } else {
+            continue;
+          }
+        }
+
         // Handle voice/audio messages — transcribe to text
         const voiceFileId = update.message?.voice?.file_id
           || update.message?.audio?.file_id
           || update.message?.video_note?.file_id;
-        let text: string | undefined = update.message?.text;
         if (!text && voiceFileId) {
           const transcribed = await this.transcribeVoice(voiceFileId);
           if (transcribed) {
@@ -264,7 +364,7 @@ export class TelegramService {
         for (const e of employees) {
           const pName = (e.projectId as any)?.name || 'Unknown';
           const statusIcon = e.status === 'working' ? '🟢' : e.status === 'paused' ? '🟡' : '⚪';
-          msg += `${statusIcon} ${e.avatar} *${e.name}* — ${e.title}\n   📁 ${pName} | Tasks: ${e.taskHistory.length}\n`;
+          msg += `${statusIcon} ${e.avatar} *${e.name}* — ${e.title}\n   🏢 ${pName} | Tasks: ${e.taskHistory.length}\n`;
         }
         return msg;
       }
@@ -277,7 +377,7 @@ export class TelegramService {
         for (const e of working) {
           const pName = (e.projectId as any)?.name || 'Unknown';
           const task = e.taskHistory.find(t => t.status === 'in_progress');
-          msg += `${e.avatar} *${e.name}*\n   📁 ${pName}\n   📝 ${task?.description || 'Unknown task'}\n\n`;
+          msg += `${e.avatar} *${e.name}*\n   🏢 ${pName}\n   📝 ${task?.description || 'Unknown task'}\n\n`;
         }
         return msg;
       }
@@ -289,16 +389,17 @@ export class TelegramService {
         let msg = `⚪ *Idle Employees*\n\n`;
         for (const e of idle) {
           const pName = (e.projectId as any)?.name || 'Unknown';
-          msg += `${e.avatar} *${e.name}* — ${e.title}\n   📁 ${pName}\n`;
+          msg += `${e.avatar} *${e.name}* — ${e.title}\n   🏢 ${pName}\n`;
         }
         return msg;
       }
 
+      case '/companies':
       case '/projects': {
         const projects = await Project.find({ userId });
-        if (!projects.length) return '📁 No projects yet.';
+        if (!projects.length) return '🏢 No companies yet.';
 
-        let msg = `📁 *Projects*\n\n`;
+        let msg = `🏢 *Companies*\n\n`;
         for (const p of projects) {
           const empCount = await Employee.countDocuments({ projectId: p._id, userId });
           msg += `*${p.name}*\n   ${p.description || 'No description'}\n   👥 ${empCount} employees | 💰 $${p.mrr || 0} MRR\n\n`;
@@ -407,6 +508,7 @@ export class TelegramService {
       const transcription = await openai.audio.transcriptions.create({
         file: fs.createReadStream(tmpFile),
         model: 'whisper-1',
+        language: 'en',
       });
 
       console.log(`[Telegram] Voice: transcribed "${(transcription.text || '').substring(0, 50)}..."`);
@@ -417,6 +519,134 @@ export class TelegramService {
     } catch (err: any) {
       console.log(`[Telegram] Voice transcription failed: ${err.message}`);
       if (tmpFile && fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
+      return null;
+    }
+  }
+
+  // ── File handling ──
+
+  /** Files directory for Alfred */
+  private static get filesDir(): string {
+    const dir = path.resolve(__dirname, '../../../ManagerMemory/files');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+
+  /** Handle an incoming document or photo message — download, extract text, return prompt */
+  private async handleFileMessage(message: any, chatId: string): Promise<string | null> {
+    const doc = message.document;
+    const photo = message.photo;
+    const caption = message.caption || '';
+
+    try {
+      let fileId: string;
+      let fileName: string;
+
+      if (doc) {
+        fileId = doc.file_id;
+        fileName = doc.file_name || `doc-${Date.now()}`;
+      } else if (photo?.length) {
+        // Telegram sends multiple sizes — take the largest
+        const largest = photo[photo.length - 1];
+        fileId = largest.file_id;
+        fileName = `photo-${Date.now()}.jpg`;
+      } else {
+        return null;
+      }
+
+      // Get file path from Telegram
+      const fileInfo = await this.apiGet('getFile', { file_id: fileId });
+      const filePath = fileInfo?.result?.file_path;
+      if (!filePath) {
+        await this.apiCall('sendMessage', { chat_id: chatId, text: '⚠️ Could not get file from Telegram.' });
+        return null;
+      }
+
+      // Download to ManagerMemory/files/
+      const ext = path.extname(fileName) || path.extname(filePath) || '';
+      const safeFileName = `${Date.now()}-${fileName.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+      const destPath = path.join(TelegramService.filesDir, safeFileName);
+      const fileUrl = `https://api.telegram.org/file/bot${this.botToken}/${filePath}`;
+      await this.downloadFile(fileUrl, destPath);
+
+      const fileSize = fs.statSync(destPath).size;
+      console.log(`[Telegram] File downloaded: ${safeFileName} (${fileSize} bytes)`);
+
+      const lowerExt = ext.toLowerCase();
+
+      // PDF — extract text
+      if (lowerExt === '.pdf') {
+        try {
+          const pdfParse = require('pdf-parse');
+          const buffer = fs.readFileSync(destPath);
+          const data = await pdfParse(buffer);
+          const textContent = (data.text || '').substring(0, 15000);
+          const pageCount = data.numpages || 0;
+
+          await this.apiCall('sendMessage', {
+            chat_id: chatId,
+            text: `📄 _PDF received: ${fileName} (${pageCount} pages)_`,
+            parse_mode: 'Markdown',
+          });
+
+          // Save extracted text alongside the PDF for Alfred to reference later
+          const txtPath = destPath.replace(/\.pdf$/i, '.txt');
+          fs.writeFileSync(txtPath, `Extracted from: ${fileName}\nPages: ${pageCount}\n\n${data.text || ''}`, 'utf-8');
+
+          return caption
+            ? `[Bruce sent a PDF: "${fileName}" (${pageCount} pages)] ${caption}\n\nPDF CONTENT:\n${textContent}`
+            : `[Bruce sent a PDF: "${fileName}" (${pageCount} pages)]\n\nPDF CONTENT:\n${textContent}`;
+        } catch (err: any) {
+          console.log(`[Telegram] PDF parse failed: ${err.message}`);
+          await this.apiCall('sendMessage', {
+            chat_id: chatId,
+            text: `📄 _PDF saved but could not extract text: ${fileName}_`,
+            parse_mode: 'Markdown',
+          });
+          return caption
+            ? `[Bruce sent a PDF: "${fileName}" — text extraction failed. File saved at: ${destPath}] ${caption}`
+            : `[Bruce sent a PDF: "${fileName}" — text extraction failed. File saved at: ${destPath}]`;
+        }
+      }
+
+      // Text files — read directly
+      if (['.txt', '.md', '.csv', '.json', '.xml', '.html', '.yml', '.yaml', '.log'].includes(lowerExt)) {
+        const content = fs.readFileSync(destPath, 'utf-8').substring(0, 15000);
+        await this.apiCall('sendMessage', {
+          chat_id: chatId,
+          text: `📄 _File received: ${fileName}_`,
+          parse_mode: 'Markdown',
+        });
+        return caption
+          ? `[Bruce sent a file: "${fileName}"] ${caption}\n\nFILE CONTENT:\n${content}`
+          : `[Bruce sent a file: "${fileName}"]\n\nFILE CONTENT:\n${content}`;
+      }
+
+      // Images — save and reference
+      if (['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'].includes(lowerExt)) {
+        await this.apiCall('sendMessage', {
+          chat_id: chatId,
+          text: `🖼️ _Image saved: ${fileName}_`,
+          parse_mode: 'Markdown',
+        });
+        return caption
+          ? `[Bruce sent an image: "${fileName}", saved at: ${destPath}] ${caption}`
+          : `[Bruce sent an image: "${fileName}", saved at: ${destPath}]`;
+      }
+
+      // Other files — just save
+      await this.apiCall('sendMessage', {
+        chat_id: chatId,
+        text: `📎 _File saved: ${fileName}_`,
+        parse_mode: 'Markdown',
+      });
+      return caption
+        ? `[Bruce sent a file: "${fileName}", saved at: ${destPath}] ${caption}`
+        : `[Bruce sent a file: "${fileName}", saved at: ${destPath}]`;
+
+    } catch (err: any) {
+      console.log(`[Telegram] File handling failed: ${err.message}`);
+      await this.apiCall('sendMessage', { chat_id: chatId, text: `⚠️ Failed to process file: ${err.message}` });
       return null;
     }
   }
@@ -443,6 +673,10 @@ export class TelegramService {
   }
 
   private apiCall(method: string, body: any): Promise<boolean> {
+    return this.apiCallWithResponse(method, body).then(r => r.ok);
+  }
+
+  private apiCallWithResponse(method: string, body: any): Promise<{ ok: boolean; errorCode?: number; description?: string }> {
     return new Promise((resolve) => {
       const payload = JSON.stringify(body);
       const req = https.request({
@@ -453,9 +687,20 @@ export class TelegramService {
       }, (res) => {
         let data = '';
         res.on('data', (chunk) => (data += chunk));
-        res.on('end', () => resolve(res.statusCode === 200));
+        res.on('end', () => {
+          if (res.statusCode === 200) {
+            resolve({ ok: true });
+          } else {
+            try {
+              const parsed = JSON.parse(data);
+              resolve({ ok: false, errorCode: parsed.error_code, description: parsed.description });
+            } catch {
+              resolve({ ok: false, errorCode: res.statusCode, description: data.substring(0, 200) });
+            }
+          }
+        });
       });
-      req.on('error', () => resolve(false));
+      req.on('error', (err) => resolve({ ok: false, errorCode: 0, description: err.message }));
       req.write(payload);
       req.end();
     });

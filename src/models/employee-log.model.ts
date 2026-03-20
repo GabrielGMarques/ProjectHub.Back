@@ -34,8 +34,8 @@ const employeeLogSchema = new Schema<IEmployeeLog>(
   { timestamps: true }
 );
 
-// Auto-delete after 24 hours
-employeeLogSchema.index({ createdAt: 1 }, { expireAfterSeconds: 86400 });
+// Auto-delete after 7 weeks (49 days)
+employeeLogSchema.index({ createdAt: 1 }, { expireAfterSeconds: 4233600 });
 employeeLogSchema.index({ userId: 1, createdAt: -1 });
 employeeLogSchema.index({ employeeId: 1, createdAt: -1 });
 employeeLogSchema.index({ userId: 1, employeeId: 1, createdAt: -1 });

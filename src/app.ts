@@ -25,7 +25,7 @@ app.use(passport.initialize());
 configurePassport();
 
 // Routes
-app.use('/api/projects', projectRoutes);
+app.use('/api/companies', projectRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/github', githubRoutes);
 app.use('/api/analytics', analyticsRoutes);

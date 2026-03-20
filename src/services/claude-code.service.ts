@@ -35,7 +35,8 @@ async function getQuery() {
 export class ClaudeCodeService {
   isAvailable: boolean = false;
 
-  private activeSessions: Map<string, { close: () => void; projectId?: string; startedAt: Date }> = new Map();
+  private activeSessions: Map<string, { close: () => void; sdkSessionId?: string; projectId?: string; startedAt: Date }> = new Map();
+  private pendingMessages: Map<string, string[]> = new Map();
   private cleanupInterval: ReturnType<typeof setInterval> | null = null;
 
   async checkAvailability(): Promise<{ available: boolean; version: string }> {
@@ -76,6 +77,9 @@ export class ClaudeCodeService {
     let sdkSessionId: string | undefined;
     let status: 'completed' | 'failed' | 'cancelled' = 'completed';
 
+    // Initialize pending messages queue for this session
+    this.pendingMessages.set(sessionId, []);
+
     // Timeout guard
     const timer = setTimeout(() => {
       const event: ClaudeCodeEvent = {
@@ -93,59 +97,104 @@ export class ClaudeCodeService {
     collectedEvents.push(startEvent);
     onEvent(startEvent);
 
+    // Strip ANTHROPIC_API_KEY so the SDK uses the Claude Code subscription
+    const sdkEnv: Record<string, string | undefined> = { ...process.env };
+    delete sdkEnv.ANTHROPIC_API_KEY;
+
+    const baseOptions: any = {
+      allowedTools: options?.allowedTools?.length ? options.allowedTools : ['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep'],
+      cwd: resolvedPath,
+      maxTurns: 50,
+      env: sdkEnv,
+    };
+
+    let currentPrompt = prompt;
+    let resumeId = options?.resumeSdkSessionId;
+
     try {
-      // Strip ANTHROPIC_API_KEY so the SDK uses the Claude Code subscription
-      // (OAuth) instead of the raw API key used by the AI coach
-      const sdkEnv: Record<string, string | undefined> = { ...process.env };
-      delete sdkEnv.ANTHROPIC_API_KEY;
-
-      const queryOptions: any = {
-        allowedTools: options?.allowedTools?.length ? options.allowedTools : ['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep'],
-        cwd: resolvedPath,
-        maxTurns: 50,
-        env: sdkEnv,
-      };
-
-      // Resume an existing SDK session if provided
-      if (options?.resumeSdkSessionId) {
-        queryOptions.resume = options.resumeSdkSessionId;
-      }
-
-      const conversation = queryFn({
-        prompt,
-        options: queryOptions,
-      });
-
-      // Store reference so we can close it on cancel
-      this.activeSessions.set(sessionId, { close: () => conversation.close(), projectId: undefined, startedAt: new Date() });
-
-      for await (const message of conversation) {
-        // Capture SDK session ID from the first message
-        if (!sdkSessionId && message.session_id) {
-          sdkSessionId = message.session_id;
+      // Loop: run conversation, check for injected messages, resume if needed
+      while (true) {
+        const queryOptions = { ...baseOptions };
+        if (resumeId) {
+          queryOptions.resume = resumeId;
         }
-        this.processMessage(message, sessionId, (event) => {
-          collectedEvents.push(event);
-          onEvent(event);
+
+        const conversation = queryFn({
+          prompt: currentPrompt,
+          options: queryOptions,
         });
-      }
-    } catch (err: any) {
-      if (err.name === 'AbortError' || err.message === 'Query closed') {
-        status = 'cancelled';
-      } else {
-        status = 'failed';
-        const event: ClaudeCodeEvent = {
-          type: 'error',
-          content: err.message || 'Unknown SDK error',
-          sessionId,
-          timestamp: new Date(),
-        };
-        collectedEvents.push(event);
-        onEvent(event);
+
+        // Store reference so we can close it on cancel/inject
+        this.activeSessions.set(sessionId, {
+          close: () => conversation.close(),
+          sdkSessionId,
+          projectId: undefined,
+          startedAt: new Date(),
+        });
+
+        let closedForInjection = false;
+
+        try {
+          for await (const message of conversation) {
+            // Capture SDK session ID from the first message
+            if (!sdkSessionId && message.session_id) {
+              sdkSessionId = message.session_id;
+              // Update stored reference with sdkSessionId
+              const session = this.activeSessions.get(sessionId);
+              if (session) session.sdkSessionId = sdkSessionId;
+            }
+            this.processMessage(message, sessionId, (event) => {
+              collectedEvents.push(event);
+              onEvent(event);
+            });
+          }
+        } catch (err: any) {
+          // Check if this was closed for message injection
+          const pending = this.pendingMessages.get(sessionId);
+          if (pending && pending.length > 0 && (err.name === 'AbortError' || err.message === 'Query closed')) {
+            closedForInjection = true;
+          } else if (err.name === 'AbortError' || err.message === 'Query closed') {
+            status = 'cancelled';
+            break;
+          } else {
+            status = 'failed';
+            const event: ClaudeCodeEvent = {
+              type: 'error',
+              content: err.message || 'Unknown SDK error',
+              sessionId,
+              timestamp: new Date(),
+            };
+            collectedEvents.push(event);
+            onEvent(event);
+            break;
+          }
+        }
+
+        // Check for pending injected messages
+        const pending = this.pendingMessages.get(sessionId);
+        if (closedForInjection && pending && pending.length > 0 && sdkSessionId) {
+          currentPrompt = pending.shift()!;
+          resumeId = sdkSessionId;
+
+          // Emit an event so the frontend/logs show the injection
+          const injectEvent: ClaudeCodeEvent = {
+            type: 'text',
+            content: `📩 [Message injected]: ${currentPrompt}`,
+            sessionId,
+            timestamp: new Date(),
+          };
+          collectedEvents.push(injectEvent);
+          onEvent(injectEvent);
+
+          continue; // Resume the loop with the new message
+        }
+
+        break; // Normal completion, exit loop
       }
     } finally {
       clearTimeout(timer);
       this.activeSessions.delete(sessionId);
+      this.pendingMessages.delete(sessionId);
       const doneEvent: ClaudeCodeEvent = { type: 'done', sessionId, timestamp: new Date() };
       collectedEvents.push(doneEvent);
       onEvent(doneEvent);
@@ -154,9 +203,37 @@ export class ClaudeCodeService {
     return { sessionId, sdkSessionId, events: collectedEvents, status };
   }
 
+  /**
+   * Inject a message into a running session.
+   * Closes the current conversation, queues the message, and the runCommand loop
+   * will resume the SDK session with this message as the new prompt.
+   */
+  injectMessage(sessionId: string, message: string): boolean {
+    const session = this.activeSessions.get(sessionId);
+    if (!session) return false;
+
+    const pending = this.pendingMessages.get(sessionId);
+    if (!pending) return false;
+
+    // Queue the message and close the conversation to trigger resume
+    pending.push(message);
+    try { session.close(); } catch {}
+    return true;
+  }
+
+  /**
+   * Find a session by employee taskId (which is used as the sessionId in activeSessions)
+   */
+  findSessionByTaskId(taskId: string): string | null {
+    if (this.activeSessions.has(taskId)) return taskId;
+    return null;
+  }
+
   cancelSession(sessionId: string): boolean {
     const session = this.activeSessions.get(sessionId);
     if (!session) return false;
+    // Clear pending messages so the loop doesn't resume
+    this.pendingMessages.delete(sessionId);
     session.close();
     this.activeSessions.delete(sessionId);
     return true;
