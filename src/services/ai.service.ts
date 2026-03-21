@@ -156,6 +156,13 @@ ${project.monetizationPlan || 'Not set'}`;
       prompt += `\n\nPROJECT PRESENTATION:\n${project.presentation}`;
     }
 
+    if (project.applications?.length) {
+      prompt += '\n\nAPPLICATIONS:\n';
+      for (const app of project.applications) {
+        prompt += `- ${app.name} (${app.type}:${app.port}) — ${app.status}${app.testInstructions ? ' — has test instructions' : ' — NO test instructions'}\n`;
+      }
+    }
+
     if (docTexts.length > 0) {
       prompt += '\n\nATTACHED DOCUMENTS:\n';
       prompt += docTexts.join('\n\n');
@@ -179,7 +186,7 @@ You can suggest concrete changes to the project by including action blocks in yo
 Available action types:
 - add_todos: Add items to the project's TODO list. Use "items" array with string values.
 - update_presentation: Update the project presentation. Use "content" with the full markdown text.
-- update_field: Update a specific project field. Available fields: description, niche, monetizationPlan. Use "field" and "value".
+- update_field: Update a specific project field. Available fields: description, niche, monetizationPlan, testInstructions. Use "field" and "value".
 
 IMPORTANT RULES FOR ACTIONS:
 - Only suggest actions when making a specific, concrete recommendation or when the user asks for changes.

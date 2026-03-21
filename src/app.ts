@@ -13,6 +13,7 @@ import strategicChatRoutes from './routes/strategic-chat.routes';
 import employeeRoutes from './routes/employee.routes';
 import telemetryRoutes from './routes/telemetry.routes';
 import telegramRoutes from './routes/telegram.routes';
+import infrastructureRoutes from './routes/infrastructure.routes';
 
 const app = express();
 
@@ -35,6 +36,7 @@ app.use('/api/strategic-chat', strategicChatRoutes);
 app.use('/api/employees', employeeRoutes);
 app.use('/api/telemetry', telemetryRoutes);
 app.use('/api/telegram', telegramRoutes);
+app.use('/api/infrastructure', infrastructureRoutes);
 
 // Health check
 app.get('/api/health', (_req, res) => {

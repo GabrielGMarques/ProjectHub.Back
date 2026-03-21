@@ -4,7 +4,7 @@ import crypto from 'crypto';
 import { Project } from '../models/project.model';
 
 export interface ClaudeCodeEvent {
-  type: 'start' | 'text' | 'tool_use' | 'tool_result' | 'error' | 'done';
+  type: 'start' | 'text' | 'tool_use' | 'tool_result' | 'error' | 'done' | 'task_idle';
   content?: string;
   tool?: string;
   sessionId: string;
@@ -56,7 +56,7 @@ export class ClaudeCodeService {
     projectPath: string,
     prompt: string,
     onEvent: (event: ClaudeCodeEvent) => void,
-    options?: { resumeSdkSessionId?: string; allowedTools?: string[] },
+    options?: { resumeSdkSessionId?: string; allowedTools?: string[]; keepAlive?: boolean },
     timeoutMs: number = DEFAULT_TIMEOUT_MS
   ): Promise<RunCommandResult> {
     // Validate project path — normalize to forward slashes for the SDK
@@ -102,7 +102,7 @@ export class ClaudeCodeService {
     delete sdkEnv.ANTHROPIC_API_KEY;
 
     const baseOptions: any = {
-      allowedTools: options?.allowedTools?.length ? options.allowedTools : ['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep'],
+      allowedTools: options?.allowedTools?.length ? options.allowedTools : ['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', 'WebSearch'],
       cwd: resolvedPath,
       maxTurns: 50,
       env: sdkEnv,
@@ -189,7 +189,45 @@ export class ClaudeCodeService {
           continue; // Resume the loop with the new message
         }
 
-        break; // Normal completion, exit loop
+        // Keep-alive mode: don't exit, wait for next message
+        if (options?.keepAlive && sdkSessionId && status === 'completed') {
+          // Emit task_idle event so the employee service marks the task as done
+          const idleEvent: ClaudeCodeEvent = {
+            type: 'task_idle', content: '💤 Task complete — waiting for next assignment',
+            sessionId, timestamp: new Date(),
+          };
+          collectedEvents.push(idleEvent);
+          onEvent(idleEvent);
+
+          // Wait for a new message to be injected
+          await new Promise<void>((resolve) => {
+            const checkInterval = setInterval(() => {
+              const pending = this.pendingMessages.get(sessionId);
+              if (pending && pending.length > 0) {
+                clearInterval(checkInterval);
+                resolve();
+              }
+              // If session was cancelled, stop waiting
+              if (!this.activeSessions.has(sessionId)) {
+                clearInterval(checkInterval);
+                resolve();
+              }
+            }, 1000);
+          });
+
+          // Check if we were cancelled
+          if (!this.activeSessions.has(sessionId)) break;
+
+          const pending = this.pendingMessages.get(sessionId);
+          if (pending && pending.length > 0) {
+            currentPrompt = pending.shift()!;
+            resumeId = sdkSessionId;
+            status = 'completed'; // Reset for next round
+            continue;
+          }
+        }
+
+        break; // Normal completion or no keep-alive, exit loop
       }
     } finally {
       clearTimeout(timer);

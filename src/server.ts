@@ -1,8 +1,10 @@
+import http from 'http';
 import app from './app';
 import { config } from './config';
 import { connectDatabase } from './config/database';
 import { ClaudeCodeService } from './services/claude-code.service';
 import { telegramBot } from './services/telegram.service';
+import { wsService } from './services/websocket.service';
 import { User } from './models/user.model';
 import { Project } from './models/project.model';
 import { Employee } from './models/employee.model';
@@ -24,6 +26,12 @@ function countDone(todos: any[]): number {
 
 async function startServer(): Promise<void> {
   await connectDatabase();
+
+  // Migration: mark all existing task results as read (one-time)
+  await Employee.updateMany(
+    { 'taskHistory.resultRead': { $exists: false } },
+    { $set: { 'taskHistory.$[].resultRead': true } },
+  ).then(r => { if (r.modifiedCount) console.log(`[Migration] Marked ${r.modifiedCount} employee(s) task results as read`); }).catch(() => {});
 
   // Recover from crash: mark any stale "running" sessions as cancelled
   const cleaned = await claudeCodeService.cleanupStaleSessions();
@@ -154,8 +162,10 @@ async function startServer(): Promise<void> {
   // Start the always-on Manager
   managerService.start();
 
-  const server = app.listen(config.port, () => {
-    console.log(`Server running on port ${config.port}`);
+  const server = http.createServer(app);
+  wsService.init(server);
+  server.listen(config.port, () => {
+    console.log(`Server running on port ${config.port} (WebSocket on /ws)`);
   });
 
   // Graceful shutdown

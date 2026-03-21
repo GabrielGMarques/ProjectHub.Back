@@ -109,6 +109,42 @@ export interface ICoachMessage {
   timestamp: Date;
 }
 
+export interface IAppScreenshot {
+  filename: string;
+  originalName: string;
+  caption: string;
+  takenBy: string;
+  takenAt: Date;
+}
+
+export interface IApplication {
+  name: string;
+  port: number;
+  type: 'frontend' | 'backend' | 'fullstack' | 'service' | 'database';
+  dockerService: string;
+  command: string;
+  status: 'running' | 'stopped' | 'building' | 'error';
+  tested: boolean;
+  basePath: string;
+  description: string;
+  purpose: string;
+  testInstructions: string;
+  screenshots: IAppScreenshot[];
+}
+
+export interface IStrategicCycle {
+  status: 'idle' | 'pending_directions' | 'active' | 'dev' | 'qa' | 'done';
+  advice: string;
+  advisorRole: string;
+  advisorName: string;
+  startedAt?: Date;
+  completedAt?: Date;
+  devTasksTotal: number;
+  devTasksDone: number;
+  qaTasksTotal: number;
+  qaTasksDone: number;
+}
+
 export interface IProject extends Document {
   userId: Types.ObjectId;
   name: string;
@@ -130,10 +166,13 @@ export interface IProject extends Document {
   monetizationPlan: string;
   schedule: IWeeklySchedule;
   documents: IDocument[];
+  applications: IApplication[];
   marketingResearch: IMarketingResearch;
   agentSessions: IAgentSession[];
   coachMessages: ICoachMessage[];
   onHolding: boolean;
+  strategicDirection: string;
+  strategicCycle: IStrategicCycle;
   sortOrder: number;
   burndownSortOrder: number;
   createdAt: Date;
@@ -160,6 +199,19 @@ const projectSchema = new Schema<IProject>(
     impact: { type: String, enum: ['low', 'medium', 'high'], default: 'low' },
     niche: { type: String, default: '', trim: true },
     onHolding: { type: Boolean, default: false },
+    strategicDirection: { type: String, default: '' },
+    strategicCycle: {
+      status: { type: String, enum: ['idle', 'pending_directions', 'active', 'dev', 'qa', 'done'], default: 'idle' },
+      advice: { type: String, default: '' },
+      advisorRole: { type: String, default: '' },
+      advisorName: { type: String, default: '' },
+      startedAt: { type: Date },
+      completedAt: { type: Date },
+      devTasksTotal: { type: Number, default: 0 },
+      devTasksDone: { type: Number, default: 0 },
+      qaTasksTotal: { type: Number, default: 0 },
+      qaTasksDone: { type: Number, default: 0 },
+    },
     timeConsumption: { type: Number, default: 0, min: 0 },
     timeSpent: { type: Number, default: 0, min: 0 },
     timeSpentPerDay: {
@@ -206,6 +258,26 @@ const projectSchema = new Schema<IProject>(
       },
       lastResearchAt: Date,
     },
+    applications: [{
+      name: { type: String, required: true, trim: true },
+      port: { type: Number, required: true },
+      type: { type: String, enum: ['frontend', 'backend', 'fullstack', 'service', 'database'], default: 'fullstack' },
+      dockerService: { type: String, default: '', trim: true },
+      command: { type: String, default: '', trim: true },
+      status: { type: String, enum: ['running', 'stopped', 'building', 'error'], default: 'stopped' },
+      tested: { type: Boolean, default: false },
+      basePath: { type: String, default: '', trim: true },
+      description: { type: String, default: '', trim: true },
+      purpose: { type: String, default: '', trim: true },
+      testInstructions: { type: String, default: '', trim: true },
+      screenshots: [{
+        filename: { type: String, required: true },
+        originalName: { type: String, default: '' },
+        caption: { type: String, default: '' },
+        takenBy: { type: String, default: '' },
+        takenAt: { type: Date, default: Date.now },
+      }],
+    }],
     agentSessions: [{
       sessionId: String,
       sdkSessionId: String,

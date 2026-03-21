@@ -8,6 +8,8 @@ import { ClaudeCodeService } from './claude-code.service';
 import { telegramBot } from './telegram.service';
 import { TelemetryService } from './telemetry.service';
 import { ProjectService } from './project.service';
+import { employeeMemoryService } from './employee-memory.service';
+import { wsService } from './websocket.service';
 
 const claudeCodeService = new ClaudeCodeService();
 const telegramService = telegramBot;
@@ -27,6 +29,9 @@ function empLog(
     employeeName: emp.name, employeeAvatar: emp.avatar, employeeRole: emp.role,
     projectName, metadata,
   }).catch(() => {});
+
+  // Real-time push
+  wsService.employeeLog(employeeId, projectId, { category, content, employeeName: emp.name });
 }
 
 export class EmployeeService {
@@ -107,7 +112,33 @@ export class EmployeeService {
   ): Promise<{ status: string }> {
     const employee = await Employee.findOne({ _id: employeeId, userId });
     if (!employee) throw new Error('Employee not found');
-    if (employee.status === 'working') throw new Error('Employee is already working on a task');
+
+    // Try to inject into existing session (works for both idle and working employees)
+    const existingSession = employee.activeSessionId || employee.currentTask;
+    if (existingSession) {
+      const msg = employee.status === 'working'
+        ? `ADDITIONAL TASK FROM ALFRED (add to your current work):\n${task}\n\nHandle this alongside or after your current task.`
+        : `NEW TASK FROM ALFRED:\n${task}\n\nYou are still in the same workspace. Use your existing knowledge and context. Start working on this now.`;
+      const injected = claudeCodeService.injectMessage(existingSession, msg);
+      if (injected) {
+        const taskId = crypto.randomUUID();
+        employee.status = 'working';
+        employee.currentTask = existingSession;
+        employee.lastActivity = new Date();
+        employee.taskHistory.push({ taskId, description: task, status: 'in_progress', resultRead: false, startedAt: new Date() });
+        await employee.save();
+
+        const project = await projectService.findById(employee.projectId.toString(), userId);
+        const empInfo = { name: employee.name, avatar: employee.avatar, role: employee.role };
+        empLog(userId, employee._id.toString(), employee.projectId.toString(), 'task_start',
+          `[Injected into session] ${task}`, empInfo, project?.name || 'Unknown', { taskId, resumed: true });
+        telegramService.notifyTaskStarted(employee.name, project?.name || 'Unknown', task).catch(() => {});
+        return { status: 'resumed' };
+      }
+      // Inject failed — session is dead, clear and fall through to new session
+      employee.activeSessionId = '';
+      await employee.save();
+    }
 
     const project = await projectService.findById(employee.projectId.toString(), userId);
     if (!project) throw new Error('Project not found');
@@ -126,6 +157,7 @@ export class EmployeeService {
       taskId,
       description: task,
       status: 'in_progress',
+      resultRead: false,
       startedAt: new Date(),
     });
     await employee.save();
@@ -174,12 +206,23 @@ export class EmployeeService {
     const teamMembers = await Employee.find({ projectId: project._id, userId, _id: { $ne: employee._id } });
     const teamList = teamMembers.map(m => `- ${m.avatar} ${m.name} (${m.title})`).join('\n') || 'None';
 
+    // Build skills context — employee's assigned skills + discovered local Claude Code skills
+    const skillsCtx = this.buildSkillsContext(employee);
+    const memoryCtx = await employeeMemoryService.buildMemoryContext(employee._id.toString());
+
+    // Build applications context
+    const appsCtx = (project.applications || []).length > 0
+      ? `\nREGISTERED APPLICATIONS:\n${(project.applications || []).map(a =>
+          `  - ${a.name} (${a.type}:${a.port}) — ${a.status} — path: ${a.basePath || '/' + project.name.toLowerCase().replace(/[^a-z0-9]+/g, '-') + '/' + a.name.toLowerCase().replace(/[^a-z0-9]+/g, '-')} — docker: ${a.dockerService || 'N/A'}`
+        ).join('\n')}\n  Gateway URL: https://nonshattering-adelaida-ponchoed.ngrok-free.dev`
+      : '';
+
     const prompt = `${employee.systemPrompt}
 
 PROJECT: ${project.name}
 ${project.description ? `DESCRIPTION: ${project.description}` : ''}
 WORKING DIRECTORY: ${normCwd}
-${normFolders.length > 1 ? `ALL PROJECT FOLDERS:\n${normFolders.map(f => `  - ${f}`).join('\n')}` : ''}
+${normFolders.length > 1 ? `ALL PROJECT FOLDERS:\n${normFolders.map(f => `  - ${f}`).join('\n')}` : ''}${appsCtx}
 
 WORKSPACE RULES:
 This company folder is a MONOREPO workspace. Treat it as such.
@@ -193,13 +236,12 @@ This company folder is a MONOREPO workspace. Treat it as such.
 - The root folder may contain shared config files (docker-compose.yml, .gitignore, README.md) — those are fine at the root level.
 - The .agents/ folder is reserved for internal communication — never put project code in there.
 
-TECH STACK (MANDATORY):
-- Backend code MUST be written in Node.js (TypeScript preferred).
-- Frontend code MUST be written in Next.js (React + TypeScript).
-- Do NOT use other backend frameworks (Django, Flask, Rails, etc.) or frontend frameworks (Angular, Vue, Svelte, etc.) unless explicitly told otherwise for a specific project.
-- When creating a new backend project subfolder, initialize it with Node.js (package.json, tsconfig.json, etc.).
-- When creating a new frontend project subfolder, initialize it with Next.js (npx create-next-app or manual setup).
-- If you find existing code in a different stack, do NOT rewrite it unless asked — but all NEW code must follow this rule.
+PREFERRED TECH STACK:
+- Backend: Node.js (TypeScript preferred) with Express or Fastify — this is the default choice for new backends.
+- Frontend: Next.js (React + TypeScript) — this is the default choice for new frontends.
+- These are PREFERENCES, not hard rules. If the task requires a different technology (Python, Go, PHP, etc.) or you're integrating a third-party service that uses a different stack, use whatever fits best.
+- If you find existing code in a different stack, work with it — do NOT rewrite it unless asked.
+- The only hard rule: the final result MUST run in a Docker container and be registered as a company application.
 
 DOCKER (MANDATORY):
 - ALL applications MUST be containerized with Docker.
@@ -264,29 +306,25 @@ NEVER loop on the same failing action. This wastes time and resources. Adapt or 
 TEAM MEMBERS:
 ${teamList}
 
-COMMUNICATION:
-- Read messages from team: check files in ${commsDir}/
-- Write your updates: create/update files in ${commsDir}/ named like "${employee.role}-update.md" or "${employee.role}-to-<role>.md"
-- Always check .agents/comms/ for messages from other team members before starting work
-- Write a brief status update in .agents/comms/${employee.role}-status.md when you finish
+COMMUNICATION (MANDATORY — you MUST do all of this):
 
-MESSAGES TO ALFRED (your manager):
-If you need to communicate something to Alfred (your manager), write a JSON file to:
-  ${normCwd}/.agents/inbox/alfred-${employee.role}-${taskId}.json
-The file MUST be valid JSON with this structure:
+1. BEFORE STARTING: Read ALL files in ${commsDir}/ to see messages from teammates and Alfred.
+2. DURING WORK: If you need help from another role, write a file: ${commsDir}/${employee.role}-to-<target-role>.md
+   Example: ${commsDir}/${employee.role}-to-qa-tester.md — "Please test the login page on port 3001"
+3. WHEN DONE: Write your status to: ${commsDir}/${employee.role}-status.md
+   Include: what you did, what's ready for the next person, any issues.
+4. ALWAYS: Check ${commsDir}/ periodically during long tasks — teammates may send you messages.
+
+MESSAGES TO ALFRED (MANDATORY after every task):
+Write a JSON file to: ${normCwd}/.agents/inbox/alfred-${employee.role}-${taskId}.json
 {
   "type": "issue" | "question" | "confirmation" | "completion" | "info",
   "subject": "Short one-line summary",
-  "body": "Detailed explanation of what you need, found, or want to report"
+  "body": "Detailed explanation"
 }
-Use this when:
-- You hit a blocker or error you can't resolve → type: "issue"
-- You need input or a decision from the manager → type: "question"
-- You finished something significant and want review → type: "confirmation"
-- You completed the full task with a summary → type: "completion"
-- You found something noteworthy (security issue, optimization, etc.) → type: "info"
-You can write MULTIPLE inbox files (use different filenames) if you have several things to report.
-Alfred reads these between loops and will act on them. Do NOT skip this — proactive communication is expected.
+Use "completion" when you finish a task. Use "issue" if stuck. Use "question" if you need a decision.
+You MUST write an inbox message after EVERY task. Alfred reads these and acts on them.
+If you don't communicate, Alfred won't know your task is done and can't assign QA or next steps.
 
 EXECUTION LOG (MANDATORY):
 When you finish your task, you MUST write an execution log to: ${normCwd}/.agents/exec-logs/${employee.role}-${taskId}.md
@@ -299,6 +337,77 @@ The log must contain:
 - Status: ✅ Completed / ⚠️ Partial / ❌ Failed
 This log is read by the Infra Administrator to verify your work. Be honest and thorough.
 
+WORKING STATUS — YOUR #1 RESPONSIBILITY:
+Alfred reads your working status to know what you're doing. He checks every 5 minutes.
+This is your main communication channel with Alfred — he reads it BEFORE asking you anything.
+${employee.workingStatus ? `\nYOUR CURRENT WORKING STATUS: "${employee.workingStatus}"` : '\nYou have NO working status set yet. UPDATE IT IMMEDIATELY.'}
+
+UPDATE COMMAND (no auth needed — just run it):
+  curl -s -X POST http://localhost:3777/api/employees/${employee._id}/self/working-status \\
+    -H "Content-Type: application/json" \\
+    -d '{"status":"YOUR DETAILED STATUS"}'
+
+WHEN TO UPDATE:
+1. IMMEDIATELY when you start working — what you plan to do
+2. After EVERY significant action — file created, bug found, test passed, etc.
+3. When DONE — include the word "done" or "idle" and the system auto-completes your tasks
+4. When STUCK — describe the blocker so Alfred can help
+
+YOUR STATUS MUST BE IN MARKDOWN FORMAT. Use headers, bullet lists, checkboxes, code blocks, and tables.
+
+REQUIRED SECTIONS (use ## headers):
+## Task — What Alfred asked you to do
+## Progress — Checklist: ✅ done items, ⬜ pending items
+## Files Changed — Table or list of every file created/modified/deleted
+## Running Services — Ports, URLs, endpoints
+## Current — What you are doing RIGHT NOW
+## Blockers — Issues, errors (or "None")
+## Next — What you will do next
+## State — "working", "stuck", "done and idle"
+
+EXAMPLE OF A GOOD STATUS:
+"## Login Page Implementation
+
+### Progress
+- ✅ Created \`src/pages/Login.tsx\` — email/password form (89 lines)
+- ✅ Added \`/login\` route in \`App.tsx\`
+- ✅ Connected to auth API on port 4001
+- ⬜ Forgot-password link
+- ⬜ Error message styling
+
+### Files Changed
+| File | Action | Details |
+|------|--------|---------|
+| \`src/pages/Login.tsx\` | Created | 89 lines, form component |
+| \`src/App.tsx\` | Modified | Added route |
+| \`src/styles/login.css\` | Created | Styling |
+
+### Running Services
+- Frontend: \`http://localhost:3001\`
+- Auth API: \`http://localhost:4001\`
+
+### Current
+Styling the error message component.
+
+### Next
+Add forgot-password flow, then mark done.
+
+### State
+working — ~70% complete"
+
+BAD STATUS (DO NOT write like this): "Working on it." / "Almost done." / "Making progress."
+
+CONSEQUENCES:
+- No status update for 5 min → Alfred nudges you
+- Still no update → Alfred warns you (and notifies Bruce)
+- 3rd time → Alfred restarts your session
+
+ADDITIONAL COMMANDS (optional — working-status is usually enough):
+  curl -s -X POST http://localhost:3777/api/employees/${employee._id}/self/task-done -H "Content-Type: application/json" -d '{"taskId":"${taskId}","result":"what you did"}'
+  curl -s -X POST http://localhost:3777/api/employees/${employee._id}/self/status -H "Content-Type: application/json" -d '{"status":"idle"}'
+
+${skillsCtx}
+${memoryCtx}
 YOUR TASK:
 ${task}`;
 
@@ -309,6 +418,23 @@ ${task}`;
     let lastError = '';
 
     const eventHandler = (event: any) => {
+      // Capture session ID on start so we can resume later
+      if (event.type === 'start' && event.sessionId) {
+        Employee.findByIdAndUpdate(employeeId, { activeSessionId: event.sessionId }).catch(() => {});
+      }
+      // Task completed in keepAlive mode — mark employee idle without killing session
+      // task_idle: SDK conversation ended — keep session reference but do NOT set employee idle.
+      // The employee is responsible for calling task-done and setting themselves idle.
+      if (event.type === 'task_idle') {
+        Employee.findById(employeeId).then(fresh => {
+          if (!fresh) return;
+          fresh.lastActivity = new Date();
+          if (event.sessionId) fresh.activeSessionId = event.sessionId;
+          fresh.save().catch(() => {});
+          // Collect inbox messages
+          this.collectInboxMessages(userId, eId, pId, cwd, empInfo, pName, taskId).catch(() => {});
+        }).catch(() => {});
+      }
       if (event.type === 'tool_use') {
         empLog(userId, eId, pId, 'tool_use', `${event.tool}: ${(event.content || '').substring(0, 300)}`, empInfo, pName, { tool: event.tool });
       } else if (event.type === 'tool_result') {
@@ -343,25 +469,23 @@ ${task}`;
         try {
           const result = await claudeCodeService.runCommand(cwd, currentPrompt, eventHandler, {
             allowedTools: employee.allowedTools?.length ? employee.allowedTools : undefined,
-            resumeSdkSessionId: resumeId,
+            resumeSdkSessionId: resumeId || employee.sdkSessionId || undefined,
+            keepAlive: true,
           });
 
           if (result.sdkSessionId) lastSdkSessionId = result.sdkSessionId;
 
           if (result.status === 'completed') {
             finalStatus = 'completed';
-            const textEvents = result.events.filter(e => e.type === 'text').map(e => e.content).join('\n');
-            // Update task in DB
+            // Session ended — save session ID for resume, but do NOT set idle.
+            // Employee is responsible for calling task-done + setting idle.
             const fresh = await Employee.findById(employeeId);
             if (fresh) {
-              const taskEntry = fresh.taskHistory.find(t => t.taskId === taskId);
-              if (taskEntry) { taskEntry.status = 'completed'; taskEntry.completedAt = new Date(); taskEntry.result = textEvents.substring(0, 5000); }
-              fresh.status = 'idle';
-              fresh.currentTask = '';
               fresh.lastActivity = new Date();
+              if (result.sdkSessionId) fresh.sdkSessionId = result.sdkSessionId;
               await fresh.save();
             }
-            break; // Success — exit retry loop
+            break; // Exit retry loop — employee handles the rest
           }
 
           if (result.status === 'cancelled') {
@@ -394,14 +518,13 @@ ${task}`;
         }
       }
 
-      // All retries exhausted without success
+      // All retries exhausted — log failure but do NOT set idle. Employee handles it.
       if (finalStatus !== 'completed' && finalStatus !== 'cancelled') {
         const fresh = await Employee.findById(employeeId);
         if (fresh) {
           const taskEntry = fresh.taskHistory.find(t => t.taskId === taskId);
           if (taskEntry) { taskEntry.status = 'failed'; taskEntry.completedAt = new Date(); taskEntry.result = `Failed after ${attempt} attempts: ${lastError}`; }
-          fresh.status = 'idle';
-          fresh.currentTask = '';
+          fresh.lastActivity = new Date();
           await fresh.save();
         }
       }
@@ -417,12 +540,9 @@ ${task}`;
 
       this.collectInboxMessages(userId, eId, pId, cwd, empInfo, pName, taskId).catch(() => {});
 
-      if (finalStatus === 'completed') {
-        empLog(userId, eId, pId, 'task_complete', `Task completed in ${((duration) / 1000).toFixed(1)}s (${attempt} attempt${attempt > 1 ? 's' : ''}): ${task}`, empInfo, pName, { durationMs: duration, taskId, attempts: attempt });
-        telegramService.notifyTaskCompleted(employee.name, project.name, task).catch(() => {});
-      } else {
-        empLog(userId, eId, pId, 'task_fail', `Task failed after ${attempt} attempt(s): ${task}`, empInfo, pName, { durationMs: duration, taskId, attempts: attempt, lastError });
-        telegramService.notifyTaskFailed(employee.name, project.name, task, `Failed after ${attempt} attempts: ${lastError}`).catch(() => {});
+      // Log the session end — but employee controls task-done and idle via self-management API
+      if (finalStatus !== 'completed' && finalStatus !== 'cancelled') {
+        empLog(userId, eId, pId, 'error', `Session ended after ${attempt} attempt(s): ${lastError}`, empInfo, pName, { durationMs: duration, taskId, attempts: attempt, lastError });
       }
 
       return { status: finalStatus };
@@ -450,24 +570,27 @@ ${task}`;
   }
 
   /** Stop a running employee task */
+  /** Stop = kill session completely. Only when Bruce explicitly asks. */
   async stopTask(userId: string, employeeId: string): Promise<{ stopped: boolean }> {
     const employee = await Employee.findOne({ _id: employeeId, userId });
     if (!employee) throw new Error('Employee not found');
-    if (employee.status !== 'working') return { stopped: false };
 
-    // Cancel the Claude Code session
-    if (employee.currentTask) {
-      claudeCodeService.cancelSession(employee.currentTask);
+    // Kill all sessions
+    if (employee.currentTask) claudeCodeService.cancelSession(employee.currentTask);
+    if (employee.activeSessionId && employee.activeSessionId !== employee.currentTask) {
+      claudeCodeService.cancelSession(employee.activeSessionId);
     }
 
     const lastTask = employee.taskHistory[employee.taskHistory.length - 1];
     if (lastTask?.status === 'in_progress') {
       lastTask.status = 'failed';
-      lastTask.result = 'Stopped by user';
+      lastTask.result = 'Stopped by Bruce';
       lastTask.completedAt = new Date();
     }
     employee.status = 'idle';
     employee.currentTask = '';
+    employee.activeSessionId = '';
+    employee.sdkSessionId = '';
     await employee.save();
 
     const project = await projectService.findById(employee.projectId.toString(), userId);
@@ -487,8 +610,10 @@ ${task}`;
     const employee = await Employee.findOne({ _id: employeeId, userId });
     if (!employee) throw new Error('Employee not found');
 
-    if (employee.status !== 'working' || !employee.currentTask) {
-      return { delivered: false, detail: `${employee.name} is not currently working. Status: ${employee.status}` };
+    // Try to deliver to active session — works for both working and idle employees
+    const sessionToUse = employee.currentTask || employee.activeSessionId;
+    if (!sessionToUse) {
+      return { delivered: false, detail: `${employee.name} has no active session. Assign a task first to wake them up.` };
     }
 
     const project = await projectService.findById(employee.projectId.toString(), userId);
@@ -496,7 +621,7 @@ ${task}`;
     const empInfo = { name: employee.name, avatar: employee.avatar, role: employee.role };
 
     // Inject into the running Claude Code session
-    const injected = claudeCodeService.injectMessage(employee.currentTask, message);
+    const injected = claudeCodeService.injectMessage(sessionToUse, message);
 
     if (injected) {
       empLog(userId, employee._id.toString(), employee.projectId.toString(), 'text',
@@ -521,6 +646,72 @@ ${task}`;
     }
 
     return { delivered: false, detail: `Could not deliver message to ${employee.name} — no active session and no comms folder` };
+  }
+
+  /** Hard restart — kills session, then boots a new one with purpose context so the employee self-evaluates. */
+  async restartEmployee(userId: string, employeeId: string): Promise<{ message: string }> {
+    const employee = await Employee.findOne({ _id: employeeId, userId });
+    if (!employee) throw new Error('Employee not found');
+
+    // Kill all sessions
+    if (employee.currentTask) claudeCodeService.cancelSession(employee.currentTask);
+    if (employee.activeSessionId && employee.activeSessionId !== employee.currentTask) {
+      claudeCodeService.cancelSession(employee.activeSessionId);
+    }
+
+    // Collect context from the old session before clearing
+    const recentTasks = employee.taskHistory.slice(-5).map(t =>
+      `- [${t.status}] "${t.description.substring(0, 120)}"${t.result ? ` → ${t.result.substring(0, 150)}` : ''}`
+    ).join('\n');
+    const lastWS = employee.workingStatus || '';
+
+    const lastTask = employee.taskHistory[employee.taskHistory.length - 1];
+    if (lastTask?.status === 'in_progress') {
+      lastTask.status = 'failed';
+      lastTask.result = 'Session restarted — self-evaluation pending';
+      lastTask.completedAt = new Date();
+    }
+
+    employee.status = 'idle';
+    employee.currentTask = '';
+    employee.activeSessionId = '';
+    employee.sdkSessionId = '';
+    employee.workingStatus = '';
+    employee.workingStatusAt = undefined;
+    await employee.save();
+
+    // Boot a new session with purpose context — employee figures out what to do
+    const selfEvalTask = `[RESTART — SELF-EVALUATION]
+Your session was restarted. You need to figure out where things stand and what to do next.
+
+YOUR ROLE: ${employee.title} (${employee.role})
+
+YOUR RECENT TASK HISTORY:
+${recentTasks || 'No previous tasks.'}
+
+${lastWS ? `YOUR LAST WORKING STATUS: "${lastWS}"` : 'You had no working status set — that is why you were restarted.'}
+
+WHAT YOU MUST DO NOW:
+1. Check the project filesystem — look at what exists, what was built, what's incomplete
+2. Check .agents/comms/ for messages from teammates and Alfred
+3. Check .agents/exec-logs/ for your previous execution logs
+4. Evaluate: did your last task actually get DONE? Check the actual files and output.
+5. Update your working status with your findings:
+     curl -s -X POST http://localhost:3777/api/employees/${employeeId}/self/working-status \\
+       -H "Content-Type: application/json" \\
+       -d '{"status":"DESCRIBE: what is done, what is not, what you are doing now"}'
+   - If the work is DONE: include "done" and "idle" in your status text (auto-completes tasks)
+   - If the work is INCOMPLETE: describe what's left, then finish it and update status again
+   - If you're UNSURE: investigate the filesystem and figure it out
+6. If there's nothing left to do, update your status with "idle" and "done"
+
+DO NOT blindly redo your last task. CHECK FIRST. The work might already be done.
+You MUST update your working status within the first 2 minutes or you'll be flagged again.`;
+
+    // Fire and forget — the self-eval session runs in the background
+    this.assignTask(userId, employeeId, selfEvalTask, () => {}).catch(() => {});
+
+    return { message: `${employee.name} restarted — booting with self-evaluation.` };
   }
 
   async getComms(userId: string, projectId: string): Promise<{ name: string; content: string; modified: string }[]> {
@@ -585,6 +776,29 @@ ${task}`;
   async getRoleSkills(userId: string, role: string): Promise<IEmployeeSkill[]> {
     const roleSkills = await UserRoleSkills.findOne({ userId, role });
     return roleSkills?.skills || [];
+  }
+
+  /** Batch set skills for a role — updates the role-level persistence AND all existing employees of that role */
+  async setRoleSkills(userId: string, role: string, skills: IEmployeeSkill[]): Promise<{ updated: number }> {
+    // Save to role-level persistence
+    await UserRoleSkills.findOneAndUpdate(
+      { userId, role },
+      { skills },
+      { upsert: true },
+    );
+
+    // Update all existing employees of this role
+    const result = await Employee.updateMany(
+      { userId, role },
+      { skills },
+    );
+
+    return { updated: result.modifiedCount || 0 };
+  }
+
+  /** Public accessor for locally installed Claude Code skills */
+  getLocalSkills(): { name: string; description: string }[] {
+    return this.discoverLocalSkills();
   }
 
   /**
@@ -719,13 +933,103 @@ ${task}`;
           "Edit",
           "Write",
           "Glob",
-          "Grep"
+          "Grep",
+          "WebSearch",
+          "mcp__playwright_*"
         ]
       }
     };
 
     // Always overwrite to ensure latest permissions are applied
     fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2), 'utf-8');
+  }
+
+  /** Build skills context for the employee prompt — includes assigned skills + local Claude Code slash commands */
+  private buildSkillsContext(employee: IEmployee): string {
+    const sections: string[] = [];
+
+    // 1. Employee's assigned skills (from DB) — MANDATORY
+    if (employee.skills?.length) {
+      sections.push('YOUR ASSIGNED SKILLS (MANDATORY — YOU MUST USE THESE):');
+      sections.push('These skills have been specifically assigned to you by management. You MUST use them in your work.');
+      sections.push('Before starting ANY task, invoke each relevant skill. Do NOT skip them.');
+      sections.push('');
+      for (const s of employee.skills) {
+        sections.push(`  /${s.name}: ${s.description}`);
+        if (s.prompt) sections.push(`    Instructions: ${s.prompt.substring(0, 300)}${s.prompt.length > 300 ? '...' : ''}`);
+      }
+      sections.push('');
+      sections.push('HOW TO USE: Call the skill by name as a slash command. Examples:');
+      sections.push('  - If you have /ui-ux-pro-max → you MUST call /ui-ux-pro-max when doing any UI/UX work');
+      sections.push('  - If you have /page-cro → you MUST call /page-cro when optimizing pages');
+      sections.push('  - If you have /seo-audit → you MUST call /seo-audit when working on SEO');
+      sections.push('Failure to use your assigned skills is a policy violation. Use them FIRST, then build on their output.');
+    }
+
+    // 2. Discover locally installed Claude Code slash commands
+    const localSkills = this.discoverLocalSkills();
+    if (localSkills.length) {
+      sections.push('');
+      sections.push('ADDITIONAL AVAILABLE SKILLS (installed locally — use when helpful):');
+      for (const s of localSkills) {
+        sections.push(`  /${s.name}: ${s.description}`);
+      }
+      sections.push('');
+      sections.push('These are optional but recommended. Invoke with /skill-name when relevant to your work.');
+    }
+
+    if (!sections.length) return '';
+    return '\n' + sections.join('\n') + '\n';
+  }
+
+  /** Discover locally installed Claude Code skills from ~/.claude/commands/ */
+  private discoverLocalSkills(): { name: string; description: string }[] {
+    const skills: { name: string; description: string }[] = [];
+    const homeDir = process.env.HOME || process.env.USERPROFILE || '';
+    const commandsDir = path.join(homeDir, '.claude', 'commands');
+
+    try {
+      if (!fs.existsSync(commandsDir)) return skills;
+
+      const files = fs.readdirSync(commandsDir).filter(f => f.endsWith('.md'));
+      for (const file of files) {
+        const name = file.replace('.md', '');
+        try {
+          const content = fs.readFileSync(path.join(commandsDir, file), 'utf-8');
+          // Extract first line or description from the file
+          const firstLine = content.split('\n').find(l => l.trim() && !l.startsWith('#') && !l.startsWith('---'))?.trim() || '';
+          const description = firstLine.substring(0, 120);
+          skills.push({ name, description });
+        } catch {
+          skills.push({ name, description: '' });
+        }
+      }
+    } catch {}
+
+    // Also check ~/.claude/skills/ for directories (skill packages)
+    const skillsDir = path.join(homeDir, '.claude', 'skills');
+    try {
+      if (fs.existsSync(skillsDir)) {
+        const entries = fs.readdirSync(skillsDir, { withFileTypes: true });
+        for (const entry of entries) {
+          if (entry.isDirectory() && !skills.some(s => s.name === entry.name)) {
+            // Look for a SKILL.md or README.md inside
+            const skillMd = path.join(skillsDir, entry.name, 'SKILL.md');
+            const readme = path.join(skillsDir, entry.name, 'README.md');
+            let desc = '';
+            const descFile = fs.existsSync(skillMd) ? skillMd : fs.existsSync(readme) ? readme : null;
+            if (descFile) {
+              const content = fs.readFileSync(descFile, 'utf-8');
+              const firstLine = content.split('\n').find(l => l.trim() && !l.startsWith('#') && !l.startsWith('---'))?.trim() || '';
+              desc = firstLine.substring(0, 120);
+            }
+            skills.push({ name: entry.name, description: desc });
+          }
+        }
+      }
+    } catch {}
+
+    return skills;
   }
 
   /** Level 3: Create scripts/write-file.js helper so agents can create files without Read-first requirement */

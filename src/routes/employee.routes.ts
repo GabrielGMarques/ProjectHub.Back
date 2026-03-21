@@ -6,6 +6,14 @@ import { managerService } from '../services/manager.service';
 const router = Router();
 const controller = new EmployeeController();
 
+// Self-management — NO auth required (called by employee agents via curl)
+// Validated by employee ObjectId — agents don't have JWT tokens
+router.post('/:id/self/status', (req: any, res: any) => controller.selfSetStatus(req, res));
+router.post('/:id/self/task-done', (req: any, res: any) => controller.selfTaskDone(req, res));
+router.post('/:id/self/task-update', (req: any, res: any) => controller.selfTaskUpdate(req, res));
+router.post('/:id/self/working-status', (req: any, res: any) => controller.selfWorkingStatus(req, res));
+
+// Everything below requires auth
 router.use(authMiddleware);
 
 // Manager log
@@ -52,8 +60,10 @@ router.post('/hire', (req: any, res: any) => controller.hire(req, res));
 router.get('/project/:projectId', (req: any, res: any) => controller.getByProject(req, res));
 router.get('/project/:projectId/comms', (req: any, res: any) => controller.getComms(req, res));
 
-// Role-level skills
+// Skills
+router.get('/local-skills', (req: any, res: any) => controller.getLocalSkills(req, res));
 router.get('/role-skills/:role', (req: any, res: any) => controller.getRoleSkills(req, res));
+router.put('/role-skills/:role', (req: any, res: any) => controller.setRoleSkills(req, res));
 
 // Employee-specific
 router.get('/:id', (req: any, res: any) => controller.getById(req, res));
@@ -64,5 +74,15 @@ router.post('/:id/message', (req: any, res: any) => controller.sendMessage(req, 
 router.get('/:id/logs', (req: any, res: any) => controller.getLogs(req, res));
 router.post('/:id/skills', (req: any, res: any) => controller.addSkill(req, res));
 router.delete('/:id/skills/:skillName', (req: any, res: any) => controller.removeSkill(req, res));
+
+// Memory
+router.get('/:id/memories', (req: any, res: any) => controller.getMemories(req, res));
+router.post('/:id/memories', (req: any, res: any) => controller.addMemory(req, res));
+router.delete('/:id/memories/:memoryId', (req: any, res: any) => controller.deleteMemory(req, res));
+router.delete('/:id/memories', (req: any, res: any) => controller.wipeMemories(req, res));
+router.post('/:id/compact', (req: any, res: any) => controller.compactLogs(req, res));
+
+// Control
+router.post('/:id/restart', (req: any, res: any) => controller.restartEmployee(req, res));
 
 export default router;

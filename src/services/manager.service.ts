@@ -13,6 +13,8 @@ import { ProjectService } from './project.service';
 import { ClaudeCodeService } from './claude-code.service';
 import { claudeChat } from './claude-proxy.service';
 import { memoryService } from './memory.service';
+import { employeeMemoryService } from './employee-memory.service';
+import { infrastructureService } from './infrastructure.service';
 
 const telegramService = telegramBot;
 const employeeService = new EmployeeService();
@@ -81,12 +83,25 @@ function persistLog(
 export class ManagerService {
   private interval: ReturnType<typeof setInterval> | null = null;
   private watchdogInterval: ReturnType<typeof setInterval> | null = null;
+  private employeeCheckInterval: ReturnType<typeof setInterval> | null = null;
+  private activityCheckInterval: ReturnType<typeof setInterval> | null = null;
   private running = false;
-  private loopIntervalMs = 2 * 60 * 1000; // default 2min
+  private loopIntervalMs = 3 * 60 * 60 * 1000;     // main scan loop (default 3h)
+  private readonly ACTIVITY_CHECK_MS = 5 * 60 * 1000; // 5-min fast employee activity check
+  private activityNudgeCount = new Map<string, number>(); // empId → consecutive silent checks
+  // Multipliers of the main loop
+  private watchdogFactor = 2;    // self-heal = loop × 2 (default 6h)
+  private stuckNudgeFactor = 1;  // nudge = loop × 1 (same as loop)
+  private stuckRestartFactor = 1; // restart check = loop × 1 (same as loop)
   private lastResponseAt = 0;   // timestamp of last successful AI response
+  private scanCount = 0;        // proactive scan counter for periodic actions
   private lastUserMsgAt = 0;    // timestamp of last user message
   private msgsSinceMemorySave = 0;  // conversation memory trigger counter
   private dailySummaryDone = false; // prevents duplicate daily summaries
+  private baseLoopIntervalMs = 3 * 60 * 60 * 1000; // original loop interval before backoff
+  private lastNotificationAt = 0;  // when Alfred last sent a notification to Bruce
+  private static readonly BACKOFF_FACTOR = 1.5;
+  private static readonly MAX_BACKOFF_LOOPS = 5; // cap at base × 1.5^5 ≈ 7.6×
 
   // State tracking — avoid duplicate notifications and unnecessary AI calls
   private lastSnapshot = {
@@ -97,13 +112,49 @@ export class ManagerService {
     lastErrorCount: 0,
   };
 
+  // scanCount removed — strategic cycles tracked in DB per project
+
   getLog(): ManagerLogEntry[] { return [...managerLog]; }
+
+  /** Build strategic context — ONLY includes pending_directions companies and active cycle progress */
+  private async buildStrategicCheckContext(projects: any[], idleEmployees: any[]): Promise<string> {
+    const leaders = idleEmployees.filter(e => ['ceo', 'cto', 'tech-lead', 'product-manager'].includes(e.role));
+    const lines: string[] = [];
+
+    for (const p of projects) {
+      if (p.onHolding) continue;
+      const cycle = p.strategicCycle;
+      if (!cycle) continue;
+      const pid = p._id.toString();
+
+      // Only include companies that need action
+      if (cycle.status === 'pending_directions') {
+        const pLeaders = leaders.filter(e => e.projectId.toString() === pid);
+        if (pLeaders.length) {
+          lines.push(`\n🧭 ${p.name}: PENDING DIRECTIONS — Bruce approved. Use start_cycle NOW: ${pLeaders.map((e: any) => `${e.avatar} ${e.name} (${e._id})`).join(', ')}`);
+        } else {
+          lines.push(`\n🧭 ${p.name}: PENDING DIRECTIONS — no idle leaders yet. Wait.`);
+        }
+      } else if (cycle.status === 'dev' && cycle.devTasksDone >= cycle.devTasksTotal && cycle.devTasksTotal > 0) {
+        lines.push(`\n🔨 ${p.name}: ALL dev done (${cycle.devTasksDone}/${cycle.devTasksTotal}). Use advance_cycle to move to QA.`);
+      } else if (cycle.status === 'qa' && cycle.qaTasksDone >= cycle.qaTasksTotal && cycle.qaTasksTotal > 0) {
+        lines.push(`\n🧪 ${p.name}: ALL QA done (${cycle.qaTasksDone}/${cycle.qaTasksTotal}). Use advance_cycle to complete the cycle.`);
+      }
+      // idle, active, in-progress dev/qa, done — NOT included. No action needed from Alfred.
+    }
+
+    return lines.length ? lines.join('') : '';
+  }
   isRunning(): boolean { return this.running; }
 
   /** Public system cleanup — callable from API */
   async systemCleanup(userId: string): Promise<string> {
     return this.executeAction({ action: 'cleanup_system' }, userId);
   }
+
+  get watchdogIntervalMs(): number { return this.loopIntervalMs * this.watchdogFactor; }
+  get stuckNudgeMs(): number { return this.loopIntervalMs * this.stuckNudgeFactor; }
+  get stuckRestartMs(): number { return this.loopIntervalMs * this.stuckRestartFactor; }
 
   getLoopIntervalMin(): number { return Math.round(this.loopIntervalMs / 60000); }
 
@@ -128,7 +179,14 @@ export class ManagerService {
     });
 
     this.interval = setInterval(() => this.runCheck().catch(() => {}), this.loopIntervalMs);
-    this.watchdogInterval = setInterval(() => this.selfHeal().catch(() => {}), 30 * 60 * 1000);
+    this.watchdogInterval = setInterval(() => this.selfHeal().catch(() => {}), this.watchdogIntervalMs);
+    this.employeeCheckInterval = setInterval(() => this.employeeSelfCheck().catch(() => {}), this.loopIntervalMs / 2);
+    this.activityCheckInterval = setInterval(() => this.employeeActivityCheck().catch(() => {}), this.ACTIVITY_CHECK_MS);
+
+    // ── Restart any employees that were "working" when the server went down ──
+    this.restartStaleEmployees().catch(err => {
+      log('error', `Stale employee restart failed: ${err.message}`);
+    });
 
     // ── Wake-up sequence: recall purpose + memories, brief Bruce ──
     appendDailyLog('🚀 Alfred online — loop started');
@@ -217,6 +275,39 @@ Be Alfred. Be sharp. Hit the ground running.`;
     }
   }
 
+  /**
+   * On startup, find employees stuck in "working" status (their sessions died with the server).
+   * Restart each one so they boot into self-evaluation and figure out what to do.
+   */
+  private async restartStaleEmployees(): Promise<void> {
+    const user = await User.findOne().sort({ createdAt: 1 });
+    if (!user) return;
+    const userId = user._id.toString();
+
+    const staleWorkers = await Employee.find({ userId, status: 'working' });
+    if (!staleWorkers.length) return;
+
+    log('info', `Startup: found ${staleWorkers.length} employee(s) still marked "working" — restarting`);
+    appendDailyLog(`🔄 Startup: restarting ${staleWorkers.length} stale employee(s): ${staleWorkers.map(e => `${e.avatar} ${e.name}`).join(', ')}`);
+
+    const names: string[] = [];
+    for (const emp of staleWorkers) {
+      try {
+        await employeeService.restartEmployee(userId, emp._id.toString());
+        names.push(`${emp.avatar} ${emp.name}`);
+        log('info', `Startup: restarted ${emp.avatar} ${emp.name}`);
+      } catch (err: any) {
+        log('error', `Startup: failed to restart ${emp.name}: ${err.message}`);
+      }
+    }
+
+    if (names.length) {
+      telegramService.send(
+        `🔄 Server restarted — ${names.length} employee(s) were still working and have been rebooted with self-evaluation:\n${names.join(', ')}`
+      ).catch(() => {});
+    }
+  }
+
   /** Pre-populate snapshot so first loop doesn't re-report all old tasks */
   private async seedSnapshot(): Promise<void> {
     try {
@@ -238,6 +329,8 @@ Be Alfred. Be sharp. Hit the ground running.`;
   stop(): void {
     if (this.interval) { clearInterval(this.interval); this.interval = null; }
     if (this.watchdogInterval) { clearInterval(this.watchdogInterval); this.watchdogInterval = null; }
+    if (this.employeeCheckInterval) { clearInterval(this.employeeCheckInterval); this.employeeCheckInterval = null; }
+    if (this.activityCheckInterval) { clearInterval(this.activityCheckInterval); this.activityCheckInterval = null; }
     this.running = false;
     log('info', 'Manager loop stopped');
   }
@@ -261,7 +354,8 @@ Be Alfred. Be sharp. Hit the ground running.`;
     const totalMins = intPart * 60 + decPart;
     const clamped = Math.max(1, Math.min(24 * 60, totalMins));
     this.loopIntervalMs = clamped * 60 * 1000;
-    log('info', `Loop interval changed to ${this.getLoopIntervalDisplay()}`);
+    this.baseLoopIntervalMs = this.loopIntervalMs; // reset base so backoff scales from new value
+    log('info', `Loop interval changed to ${this.getLoopIntervalDisplay()} (watchdog: ×${this.watchdogFactor}, nudge: ×${this.stuckNudgeFactor}, restart: ×${this.stuckRestartFactor})`);
     appendDailyLog(`⏱️ Loop interval → ${this.getLoopIntervalDisplay()}`);
 
     if (this.running) {
@@ -298,6 +392,13 @@ Be Alfred. Be sharp. Hit the ground running.`;
     this.lastUserMsgAt = Date.now();
     persistLog('message', text, { direction: 'inbound', userId });
     appendDailyLog(`📩 Bruce: ${text.substring(0, 200)}`);
+
+    // Bruce responded — reset loop backoff to base interval
+    if (this.loopIntervalMs > this.baseLoopIntervalMs) {
+      this.loopIntervalMs = this.baseLoopIntervalMs;
+      log('info', `Loop backoff reset → ${this.getLoopIntervalDisplay()} (Bruce responded)`);
+      this.restart();
+    }
 
     // Build full system context (with long-term memory retrieval using user's message)
     const context = await this.buildContext(userId, text);
@@ -343,11 +444,11 @@ Be Alfred. Be sharp. Hit the ground running.`;
         finalResponse += '\n\n' + actionResults.join('\n');
       }
 
-      // Save assistant response to DB
-      await this.saveMessage(userId, 'assistant', finalResponse);
-      persistLog('message', finalResponse, { direction: 'outbound', userId });
-      appendDailyLog(`🤖 Alfred: ${finalResponse.substring(0, 200)}`);
-      log('ai', finalResponse.substring(0, 200));
+      // Save ONLY Alfred's own analysis to memory — not raw action results (employee data)
+      await this.saveMessage(userId, 'assistant', cleanResponse || finalResponse.substring(0, 500));
+      persistLog('message', cleanResponse || finalResponse.substring(0, 500), { direction: 'outbound', userId });
+      appendDailyLog(`🤖 Alfred: ${(cleanResponse || finalResponse).substring(0, 200)}`);
+      log('ai', (cleanResponse || finalResponse).substring(0, 200));
 
       // ── Trigger conversation memory every ~5 messages or on significant actions ──
       this.msgsSinceMemorySave++;
@@ -479,7 +580,12 @@ Be Alfred. Be sharp. Hit the ground running.`;
     }
 
     ctx += `CURRENT TIME: ${now.toISOString()}\n`;
-    ctx += `LOOP INTERVAL: ${this.getLoopIntervalDisplay()}\n\n`;
+    ctx += `TIMERS (all derived from main loop):\n`;
+    ctx += `  Main loop: ${this.getLoopIntervalDisplay()}\n`;
+    ctx += `  Watchdog: ×${this.watchdogFactor} = ${Math.round(this.watchdogIntervalMs / 60000)}min\n`;
+    ctx += `  Stuck nudge: ×${this.stuckNudgeFactor} = ${Math.round(this.stuckNudgeMs / 60000)}min\n`;
+    ctx += `  Stuck restart: ×${this.stuckRestartFactor} = ${Math.round(this.stuckRestartMs / 60000)}min\n`;
+    ctx += `  Change loop with adjust_timers. Other timers scale automatically.\n\n`;
 
     // Companies — separate active vs on-holding
     const activeProjects = projects.filter(p => !p.onHolding);
@@ -509,11 +615,22 @@ Be Alfred. Be sharp. Hit the ground running.`;
         ctx += `  Pending: ${pending.map((t: any) => t.text).join(', ')}\n`;
       }
 
+      if ((p.applications || []).length > 0) {
+        ctx += `  Applications (${p.applications.length}):\n`;
+        for (const a of p.applications) {
+          ctx += `    📦 ${a.name} (${a.type}:${a.port}) — ${a.status} — path: ${a.basePath}${a.testInstructions ? ' — has test instructions' : ' — ⚠️ NO test instructions'}\n`;
+        }
+      }
+
       ctx += `  Employees (${pEmps.length}):\n`;
       for (const e of pEmps) {
         ctx += `    ${e.avatar} ${e.name} (${e.title}) — ${e.status}`;
         if (e.currentTask) ctx += ` [working]`;
         ctx += ` | ID: ${e._id}\n`;
+        if (e.workingStatus) {
+          const wsAge = e.workingStatusAt ? `${Math.round((now.getTime() - new Date(e.workingStatusAt).getTime()) / 60000)}min ago` : '';
+          ctx += `      📋 Status${wsAge ? ` (${wsAge})` : ''}: ${e.workingStatus.substring(0, 300)}\n`;
+        }
       }
     }
 
@@ -529,7 +646,7 @@ Be Alfred. Be sharp. Hit the ground running.`;
       .sort({ createdAt: -1 }).limit(20).lean();
     if (unreadInbox.length) {
       ctx += `\n=== 📨 EMPLOYEE INBOX (${unreadInbox.length} unread) ===\n`;
-      ctx += `Brief summaries from your employees. Use read_employee_logs or read_exec_logs for full details.\n`;
+      ctx += `Brief summaries from your employees. Use ask_employee to get details from any employee.\n`;
       for (const m of unreadInbox) {
         const typeIcon = m.type === 'issue' ? '🚨' : m.type === 'question' ? '❓' :
           m.type === 'confirmation' ? '✅' : m.type === 'completion' ? '🏁' : 'ℹ️';
@@ -639,20 +756,58 @@ You can execute actions by including action blocks in your response. Use this ex
 \`\`\`
 
 \`\`\`manager-action
-{"action": "read_employee_logs", "employeeId": "<id>"}
+{"action": "ask_employee", "employeeId": "<id>", "question": "What did you work on? What issues did you find?"}
 \`\`\`
 
 \`\`\`manager-action
-{"action": "read_employee_history", "employeeId": "<id>", "days": 3}
+{"action": "read_task_results", "employeeId": "<id>", "unread": true}
 \`\`\`
+Read unread task results. Set "unread": true to only get new results. After reading, mark them read.
 
 \`\`\`manager-action
-{"action": "read_exec_logs", "projectId": "<id>", "employee": "optional-role-filter"}
+{"action": "mark_tasks_read", "employeeId": "<id>"}
 \`\`\`
+Mark all task results as read. Use after you've processed them. Optionally pass "taskIds": ["id1","id2"] to mark specific ones.
+
+\`\`\`manager-action
+{"action": "read_employee_status", "employeeId": "<id>"}
+\`\`\`
+Read an employee's current working status (their markdown status report). Use this to know what they're doing without asking them.
 
 \`\`\`manager-action
 {"action": "message_employee", "employeeId": "<id>", "message": "Change of plans — also add unit tests for the auth module"}
 \`\`\`
+
+\`\`\`manager-action
+{"action": "read_direction", "projectId": "<id>"}
+\`\`\`
+
+\`\`\`manager-action
+{"action": "write_direction", "projectId": "<id>", "content": "Updated strategic direction text..."}
+\`\`\`
+
+\`\`\`manager-action
+{"action": "start_cycle", "projectId": "<id>", "employeeId": "<leader-id>"}
+\`\`\`
+Works when cycle is pending_directions, idle, or done.
+
+\`\`\`manager-action
+{"action": "advance_cycle", "projectId": "<id>", "devTasks": 3}
+\`\`\`
+
+\`\`\`manager-action
+{"action": "track_cycle_task", "projectId": "<id>", "type": "dev", "done": true}
+\`\`\`
+
+\`\`\`manager-action
+{"action": "reset_cycle", "projectId": "<id>", "status": "idle"}
+\`\`\`
+Force-set a cycle to: "idle", "active", "dev", "qa", "done". Force-set to any status including "pending_directions". Use to abort a stuck cycle or skip phases.
+
+\`\`\`manager-action
+{"action": "adjust_timers", "loop": 180, "watchdogFactor": 2, "stuckNudgeFactor": 1, "stuckRestartFactor": 2}
+\`\`\`
+loop = minutes. Other timers are FACTORS of the loop (×1, ×2, ×3...). Only include what you want to change.
 
 \`\`\`manager-action
 {"action": "ack_inbox", "messageId": "<id>", "reply": "Optional reply text to send back to Bruce on Telegram"}
@@ -660,6 +815,34 @@ You can execute actions by including action blocks in your response. Use this ex
 
 \`\`\`manager-action
 {"action": "dispatch_infra", "projectId": "<id>", "task": "Investigate what the frontend-developer did and verify file integrity"}
+\`\`\`
+
+\`\`\`manager-action
+{"action": "add_application", "projectId": "<id>", "name": "landing-page", "port": 3001, "type": "frontend", "dockerService": "landing-page", "description": "Marketing landing page", "purpose": "Convert visitors into signups"}
+\`\`\`
+
+\`\`\`manager-action
+{"action": "remove_application", "projectId": "<id>", "name": "landing-page"}
+\`\`\`
+
+\`\`\`manager-action
+{"action": "update_application", "projectId": "<id>", "name": "landing-page", "status": "running", "tested": true, "testInstructions": "Steps to verify this app works correctly"}
+\`\`\`
+
+\`\`\`manager-action
+{"action": "collect_screenshots", "projectId": "<id>"}
+\`\`\`
+
+\`\`\`manager-action
+{"action": "restart_gateway"}
+\`\`\`
+
+\`\`\`manager-action
+{"action": "start_ngrok"}
+\`\`\`
+
+\`\`\`manager-action
+{"action": "stop_ngrok"}
 \`\`\`
 
 \`\`\`manager-action
@@ -675,18 +858,30 @@ RULES:
 - You are Alfred. The user is Bruce. Talk like a trusted friend — casual but sharp. Call him "Bruce", never "boss/sir/Batman".
 - Keep responses SHORT — this is Telegram. 2-3 sentences max unless Bruce asks for detail.
 - When Bruce asks you to do something, you do it immediately with the appropriate action block.
-- **NEVER start an employee without asking Bruce first.** Always suggest: "Bruce, I'd like to put [name] on [task] for [company]. Good to go?"
+- **AUTONOMOUS ACTIONS (no permission needed):**
+  - Starting a DEV (any developer role) to fix bugs, errors, or broken functionality you detected.
+  - Starting a QA Tester to test what a developer just finished or to verify a bug fix.
+  - Restarting stuck employees.
+  - Running the Infrastructure Administrator to audit/investigate.
+  - These are your operational responsibilities — handle them and just inform Bruce what you did.
+- **REQUIRES BRUCE'S PERMISSION:**
+  - Starting employees on NEW features or significant scope changes.
+  - Hiring or firing employees.
+  - Any action that changes business direction, strategy, or priorities.
+  - When in doubt, ask: "Bruce, I'd like to put [name] on [task] for [company]. Good to go?"
 - For tasks: employee MUST be "idle" and company MUST have folders.
 - Use IDs from the context above.
 - You can include multiple actions in one response.
-- To inspect files/folders or employee outputs, use list_files, read_file, read_employee_logs, and read_exec_logs. These are ON-DEMAND only.
-- To get full context of what an employee has been doing, use read_employee_history — it pulls the last N days of logs with task summaries, tool usage stats, and execution results.
-- **NEVER paste raw employee logs, exec-logs, or detailed activity into chat unless Bruce explicitly asks for them.** Keep responses short. Summarize in 1-2 sentences. If Bruce wants details, he'll ask.
-- When you use read_employee_logs/read_exec_logs internally for your own analysis (e.g. to decide what to do), do NOT forward the raw output to Bruce. Only share your conclusion.
+- To understand what an employee did: use read_task_results (reads their task descriptions and results). This is your PRIMARY source.
+- If task results are unclear: use ask_employee to ask them directly.
+- To inspect files/folders: use list_files and read_file.
+- **NEVER store raw employee logs in your memory or conversation.** Only store YOUR OWN ANALYSIS — your conclusions, decisions, and next steps based on what you read.
+- When reporting to Bruce: summarize in 1-2 sentences. Do NOT paste task results or logs — just your analysis of what happened and what to do next.
+- When you use ask_employee internally for your own analysis, do NOT forward the raw output to Bruce. Only share your conclusion.
 - **EMPLOYEE INBOX**: Employees send you messages (issues, questions, completion reports). These appear in the EMPLOYEE INBOX section above. When you see unread messages, process them: acknowledge with ack_inbox (marks as read), and if Bruce needs to know, include the key info in your response. For urgent issues or questions, tell Bruce immediately. For completion reports, review and summarize.
 - To send a message to an employee MID-EXECUTION (while they're working), use message_employee. The message is injected directly into their Claude Code session — the agent adapts immediately. Use this when Bruce wants to change direction, add requirements, or give urgent instructions to a working employee.
 - To investigate system integrity or audit employee work, use dispatch_infra — it sends the Infrastructure Administrator to check and report back.
-- Every employee writes an execution log to .agents/exec-logs/ after finishing their task. Use read_exec_logs to see what they did.
+- Every employee updates their task results and working status. Use read_task_results to see what they did. Do NOT read raw exec-logs or employee logs.
 - **Write to your daily log** after every significant action (use write_daily_log). This is your memory — it helps you pick up where you left off.
 - Read today's log (shown above) to understand what you've already done today. Don't repeat yourself.
 - You have LONG-TERM MEMORY. Recalled memories from past days appear above. Use them to maintain continuity.
@@ -793,7 +988,6 @@ RULES:
         // Fire-and-forget: start the task but don't wait for completion
         const emp = await Employee.findOne({ _id: action.employeeId, userId });
         if (!emp) throw new Error('Employee not found');
-        if (emp.status === 'working') throw new Error(`${emp.name} is already working`);
 
         // Start task in background
         employeeService.assignTask(userId, action.employeeId, action.task, () => {}).then(
@@ -871,13 +1065,12 @@ RULES:
         let resetCount = 0;
         for (const emp of employees) {
           if (emp.status === 'working') {
-            claudeCodeService.cancelSession(emp.currentTask || '');
             emp.status = 'idle';
             emp.currentTask = '';
             const lastTask = emp.taskHistory[emp.taskHistory.length - 1];
             if (lastTask?.status === 'in_progress') {
               lastTask.status = 'failed';
-              lastTask.result = 'Manager reset';
+              lastTask.result = 'Manager reset (session preserved)';
               lastTask.completedAt = new Date();
             }
             await emp.save();
@@ -885,17 +1078,13 @@ RULES:
           }
         }
         return resetCount > 0
-          ? `Reset ${resetCount} stuck employee(s) to idle`
+          ? `Reset ${resetCount} employee(s) to idle (sessions preserved)`
           : `All employees already idle`;
       }
       case 'reset_employee_memory': {
         if (!action.employeeId) throw new Error('employeeId required');
         const emp = await Employee.findOne({ _id: action.employeeId, userId });
         if (!emp) throw new Error('Employee not found');
-        if (emp.status === 'working') {
-          claudeCodeService.cancelSession(emp.currentTask || '');
-        }
-
         const project = await Project.findById(emp.projectId);
         const pName = project?.name || 'Unknown';
 
@@ -949,27 +1138,21 @@ RULES:
       }
       case 'cleanup_system': {
         const results: string[] = [];
-        // Reset ALL stuck employees across all projects
+        // Nudge stuck employees but do NOT kill their sessions
         const stuckEmployees = await Employee.find({ userId, status: 'working' });
-        let resetCount = 0;
+        let nudgedCount = 0;
         for (const emp of stuckEmployees) {
           const lastActive = emp.lastActivity || emp.hiredAt;
           const stuckMinutes = (Date.now() - new Date(lastActive).getTime()) / 60000;
-          if (stuckMinutes > 30) {
-            claudeCodeService.cancelSession(emp.currentTask || '');
-            emp.status = 'idle';
-            emp.currentTask = '';
-            const lastTask = emp.taskHistory[emp.taskHistory.length - 1];
-            if (lastTask?.status === 'in_progress') {
-              lastTask.status = 'failed';
-              lastTask.result = 'System cleanup';
-              lastTask.completedAt = new Date();
+          if (stuckMinutes > this.stuckRestartMs / 60000) {
+            const sessionToNudge = emp.currentTask || emp.activeSessionId;
+            if (sessionToNudge) {
+              claudeCodeService.injectMessage(sessionToNudge, '[SYSTEM CLEANUP] You appear stuck. Respond with any output or write to .agents/inbox/.');
             }
-            await emp.save();
-            resetCount++;
+            nudgedCount++;
           }
         }
-        if (resetCount > 0) results.push(`🔄 Reset ${resetCount} stuck employee(s)`);
+        if (nudgedCount > 0) results.push(`⚠️ Nudged ${nudgedCount} stuck employee(s)`);
         // Clean stale agent sessions
         const staleCleaned = await claudeCodeService.cleanupStaleSessions();
         if (staleCleaned > 0) results.push(`🧹 Cleaned ${staleCleaned} stale agent session(s)`);
@@ -1068,16 +1251,8 @@ RULES:
         const content = fs.readFileSync(resolvedPath, 'utf-8');
         return `📄 *${action.filename}* (${content.split('\n').length} lines)\n\n${content.substring(0, 15000)}`;
       }
-      case 'read_employee_logs': {
-        return this.readEmployeeLogs(action.employeeId, userId);
-      }
-      case 'read_employee_history': {
-        if (!action.employeeId) throw new Error('employeeId required');
-        return this.readEmployeeHistory(action.employeeId, userId, action.days || 3);
-      }
-      case 'read_exec_logs': {
-        return this.readExecLogs(action.projectId, userId, action.employee);
-      }
+      // read_employee_logs, read_employee_history, read_exec_logs REMOVED
+      // Alfred should use read_task_results and ask_employee instead — no raw logs in memory
       case 'ack_inbox': {
         if (!action.messageId) throw new Error('messageId required');
         const msg = await ManagerInbox.findOneAndUpdate(
@@ -1097,6 +1272,183 @@ RULES:
           ? `📩 ${result.detail}`
           : `⚠️ ${result.detail}`;
       }
+      case 'read_task_results': {
+        if (!action.employeeId) throw new Error('employeeId required');
+        const emp = await Employee.findById(action.employeeId);
+        if (!emp) throw new Error('Employee not found');
+        const count = Math.min(action.count || 3, 10);
+        const onlyUnread = action.unread === true;
+        let tasks = onlyUnread
+          ? emp.taskHistory.filter(t => !t.resultRead && t.result)
+          : emp.taskHistory.slice(-count);
+        tasks = tasks.reverse();
+        if (!tasks.length) return onlyUnread
+          ? `${emp.avatar} ${emp.name}: No unread task results.`
+          : `${emp.avatar} ${emp.name}: No tasks yet.`;
+        const lines = tasks.map(t => {
+          const status = t.status === 'completed' ? '✅' : t.status === 'failed' ? '❌' : '🔄';
+          const date = t.startedAt ? new Date(t.startedAt).toLocaleDateString() : '';
+          const unread = !t.resultRead ? ' 🔴 UNREAD' : '';
+          return `${status}${unread} [${date}] ${t.description}\n   Result: ${t.result || '(no result written)'}`;
+        });
+        return `📋 ${emp.avatar} ${emp.name} — ${onlyUnread ? 'unread' : 'last'} ${tasks.length} task(s):\n\n${lines.join('\n\n')}`;
+      }
+      case 'mark_tasks_read': {
+        if (!action.employeeId) throw new Error('employeeId required');
+        const emp = await Employee.findById(action.employeeId);
+        if (!emp) throw new Error('Employee not found');
+        let marked = 0;
+        const taskIds = action.taskIds as string[] | undefined;
+        for (const t of emp.taskHistory) {
+          if (!t.resultRead && t.result) {
+            if (!taskIds || taskIds.includes(t.taskId)) {
+              t.resultRead = true;
+              marked++;
+            }
+          }
+        }
+        await emp.save();
+        return `✓ Marked ${marked} task result(s) as read for ${emp.name}`;
+      }
+      case 'read_employee_status': {
+        if (!action.employeeId) throw new Error('employeeId required');
+        const emp = await Employee.findById(action.employeeId);
+        if (!emp) throw new Error('Employee not found');
+        if (!emp.workingStatus) return `${emp.avatar} ${emp.name} (${emp.status}): No working status set.`;
+        const age = emp.workingStatusAt ? `${Math.round((Date.now() - new Date(emp.workingStatusAt).getTime()) / 60000)}min ago` : '';
+        return `${emp.avatar} ${emp.name} (${emp.status}) — updated ${age}:\n\n${emp.workingStatus}`;
+      }
+      case 'ask_employee': {
+        if (!action.employeeId || !action.question) throw new Error('employeeId and question required');
+        return this.askEmployee(action.employeeId, userId, action.question);
+      }
+      case 'read_direction': {
+        if (!action.projectId) throw new Error('projectId required');
+        const proj = await Project.findById(action.projectId);
+        if (!proj) throw new Error('Project not found');
+        if (!proj.strategicDirection) return `📋 ${proj.name}: No strategic direction set yet.`;
+        return `📋 ${proj.name} Strategic Direction:\n${proj.strategicDirection}`;
+      }
+      case 'write_direction': {
+        if (!action.projectId || !action.content) throw new Error('projectId and content required');
+        const proj = await Project.findByIdAndUpdate(action.projectId, { strategicDirection: action.content }, { new: true });
+        if (!proj) throw new Error('Project not found');
+        return `📋 Strategic direction updated for ${proj.name}`;
+      }
+      case 'start_cycle': {
+        if (!action.projectId || !action.employeeId) throw new Error('projectId and employeeId (leader) required');
+        const projCheck = await Project.findById(action.projectId);
+        if (!projCheck) throw new Error('Project not found');
+        const cycleStatus = projCheck.strategicCycle?.status || 'idle';
+        if (!['pending_directions', 'idle', 'done'].includes(cycleStatus)) {
+          throw new Error(`Cannot start cycle — status is "${cycleStatus}". Finish the current cycle first (dev→qa→done).`);
+        }
+        const question = action.question || 'From a technical and business perspective, what is the most important thing missing to start generating revenue? What should we prioritize next?';
+        const adviceResult = await this.askEmployee(action.employeeId, userId, question);
+        const leader = await Employee.findById(action.employeeId);
+        const directionText = `[${new Date().toISOString().split('T')[0]}] Consulted ${leader?.name || 'leader'} (${leader?.role || 'unknown'}):\n\n${adviceResult.substring(0, 3000)}`;
+        await Project.findByIdAndUpdate(action.projectId, {
+          strategicDirection: directionText,
+          strategicCycle: {
+            status: 'active',
+            advice: adviceResult.substring(0, 2000),
+            advisorRole: leader?.role || '',
+            advisorName: leader?.name || '',
+            startedAt: new Date(),
+            completedAt: null,
+            devTasksTotal: 0, devTasksDone: 0,
+            qaTasksTotal: 0, qaTasksDone: 0,
+          },
+        });
+        appendDailyLog(`🎯 Started strategic cycle for project ${action.projectId} — consulted ${leader?.name}`);
+        return `🎯 Strategic cycle started. ${leader?.name}'s advice:\n${adviceResult}`;
+      }
+      case 'advance_cycle': {
+        if (!action.projectId) throw new Error('projectId required');
+        const proj = await Project.findById(action.projectId);
+        if (!proj?.strategicCycle) throw new Error('No strategic cycle found');
+        const cycle = proj.strategicCycle;
+        if (cycle.status === 'active') {
+          cycle.status = 'dev';
+          cycle.devTasksTotal = action.devTasks || 0;
+        } else if (cycle.status === 'dev') {
+          if (cycle.devTasksDone < cycle.devTasksTotal) {
+            throw new Error(`Cannot advance: ${cycle.devTasksDone}/${cycle.devTasksTotal} dev tasks done. All dev must finish first.`);
+          }
+          cycle.status = 'qa';
+          cycle.qaTasksTotal = action.qaTasks || 0;
+        } else if (cycle.status === 'qa') {
+          if (cycle.qaTasksDone < cycle.qaTasksTotal) {
+            throw new Error(`Cannot advance: ${cycle.qaTasksDone}/${cycle.qaTasksTotal} QA tasks done. All tests must pass first.`);
+          }
+          cycle.status = 'done';
+          cycle.completedAt = new Date();
+        } else {
+          throw new Error(`Cannot advance from status "${cycle.status}"`);
+        }
+        await proj.save();
+        return `Cycle advanced to "${cycle.status}" for ${proj.name}`;
+      }
+      case 'track_cycle_task': {
+        if (!action.projectId || !action.type) throw new Error('projectId and type (dev|qa) required');
+        const proj = await Project.findById(action.projectId);
+        if (!proj?.strategicCycle) throw new Error('No strategic cycle');
+        if (action.type === 'dev') {
+          if (action.done) { proj.strategicCycle.devTasksDone++; }
+          else { proj.strategicCycle.devTasksTotal++; }
+        } else if (action.type === 'qa') {
+          if (action.done) { proj.strategicCycle.qaTasksDone++; }
+          else { proj.strategicCycle.qaTasksTotal++; }
+        }
+        await proj.save();
+        return `Cycle task tracked: ${action.type} ${action.done ? 'completed' : 'added'}`;
+      }
+      case 'reset_cycle': {
+        if (!action.projectId) throw new Error('projectId required');
+        const valid = ['idle', 'pending_directions', 'active', 'dev', 'qa', 'done'];
+        const newStatus = valid.includes(action.status) ? action.status : 'idle';
+        const proj = await Project.findById(action.projectId);
+        if (!proj) throw new Error('Project not found');
+        const oldStatus = proj.strategicCycle?.status || 'none';
+        proj.strategicCycle = {
+          status: newStatus,
+          advice: newStatus === 'idle' ? '' : (proj.strategicCycle?.advice || ''),
+          advisorRole: newStatus === 'idle' ? '' : (proj.strategicCycle?.advisorRole || ''),
+          advisorName: newStatus === 'idle' ? '' : (proj.strategicCycle?.advisorName || ''),
+          startedAt: newStatus === 'idle' ? undefined as any : (proj.strategicCycle?.startedAt || new Date()),
+          completedAt: newStatus === 'done' ? new Date() : undefined as any,
+          devTasksTotal: 0, devTasksDone: 0,
+          qaTasksTotal: 0, qaTasksDone: 0,
+        };
+        await proj.save();
+        appendDailyLog(`🔄 Cycle reset: ${proj.name} ${oldStatus} → ${newStatus}`);
+        return `Cycle for ${proj.name} reset: ${oldStatus} → ${newStatus}`;
+      }
+      case 'adjust_timers': {
+        const changes: string[] = [];
+        if (action.loop != null) {
+          const mins = Math.max(1, Number(action.loop));
+          this.loopIntervalMs = mins * 60 * 1000;
+          this.baseLoopIntervalMs = this.loopIntervalMs;
+          changes.push(`Main loop → ${mins}min`);
+        }
+        if (action.watchdogFactor != null) {
+          this.watchdogFactor = Math.max(1, Number(action.watchdogFactor));
+          changes.push(`Watchdog → ×${this.watchdogFactor} (${Math.round(this.watchdogIntervalMs / 60000)}min)`);
+        }
+        if (action.stuckNudgeFactor != null) {
+          this.stuckNudgeFactor = Math.max(1, Number(action.stuckNudgeFactor));
+          changes.push(`Stuck nudge → ×${this.stuckNudgeFactor} (${Math.round(this.stuckNudgeMs / 60000)}min)`);
+        }
+        if (action.stuckRestartFactor != null) {
+          this.stuckRestartFactor = Math.max(1, Number(action.stuckRestartFactor));
+          changes.push(`Stuck restart → ×${this.stuckRestartFactor} (${Math.round(this.stuckRestartMs / 60000)}min)`);
+        }
+        if (!changes.length) throw new Error('No values provided');
+        this.restart();
+        appendDailyLog(`⏱️ Timers adjusted: ${changes.join(', ')}`);
+        return `⏱️ Timers updated:\n${changes.join('\n')}`;
+      }
       case 'dispatch_infra': {
         return this.dispatchInfra(action.projectId, userId, action.task);
       }
@@ -1113,6 +1465,53 @@ RULES:
           const dateStr = new Date(m.dateRange.start).toISOString().split('T')[0];
           return `[${dateStr}, ${m.granularity}] ${m.content.substring(0, 300)}`;
         }).join('\n\n');
+      }
+      case 'add_application': {
+        const app = await infrastructureService.addApplication(userId, action.projectId, {
+          name: action.name, port: action.port, type: action.type || 'fullstack',
+          dockerService: action.dockerService || action.name, command: action.command || '',
+          description: action.description || '', purpose: action.purpose || '',
+          basePath: action.basePath,
+        });
+        appendDailyLog(`📦 Registered app: ${app.name} (${app.type}:${app.port}) on ${app.basePath}`);
+        return `Registered application "${app.name}" on port ${app.port} → ${app.basePath}`;
+      }
+      case 'collect_screenshots': {
+        const count = await infrastructureService.collectScreenshots(userId, action.projectId);
+        return count > 0 ? `📸 Collected ${count} screenshot(s)` : 'No new screenshots to collect';
+      }
+      case 'remove_application': {
+        await infrastructureService.removeApplication(userId, action.projectId, action.name);
+        appendDailyLog(`🗑️ Removed app: ${action.name}`);
+        return `Removed application "${action.name}"`;
+      }
+      case 'update_application': {
+        const updates: any = {};
+        if (action.status) updates.status = action.status;
+        if (action.port) updates.port = action.port;
+        if (action.type) updates.type = action.type;
+        if (action.description) updates.description = action.description;
+        if (action.basePath) updates.basePath = action.basePath;
+        if (action.dockerService) updates.dockerService = action.dockerService;
+        if (action.command) updates.command = action.command;
+        if (action.testInstructions !== undefined) updates.testInstructions = action.testInstructions;
+        const updated = await infrastructureService.updateApplication(userId, action.projectId, action.name, updates);
+        return `Updated application "${action.name}"${updated ? ` — status: ${updated.status}` : ''}`;
+      }
+      case 'restart_gateway': {
+        const result = await infrastructureService.restartGateway(userId);
+        appendDailyLog('🔄 Gateway restarted');
+        return result;
+      }
+      case 'start_ngrok': {
+        const result = await infrastructureService.startNgrok();
+        appendDailyLog(`🌐 ${result}`);
+        return result;
+      }
+      case 'stop_ngrok': {
+        const result = infrastructureService.stopNgrok();
+        appendDailyLog(`🌐 ${result}`);
+        return result;
       }
       default:
         throw new Error(`Unknown action: ${action.action}`);
@@ -1290,6 +1689,99 @@ RULES:
     return lines.join('\n');
   }
 
+  /** Wake an employee with a REAL Claude Code session so they can read the codebase, check files, and give a grounded answer */
+  /** Ask an employee a question — works whether they're idle or working */
+  private async askEmployee(employeeId: string, userId: string, question: string): Promise<string> {
+    const emp = await Employee.findOne({ _id: employeeId, userId });
+    if (!emp) throw new Error('Employee not found');
+
+    // ── First: check the working status — it may already answer the question ──
+    const lastTask = emp.taskHistory[emp.taskHistory.length - 1];
+    const wsAge = emp.workingStatusAt ? Math.round((Date.now() - new Date(emp.workingStatusAt).getTime()) / 60000) : null;
+
+    let statusReport = `📋 ${emp.avatar} ${emp.name} (${emp.title}) — ${emp.status}\n`;
+    if (emp.workingStatus) {
+      statusReport += `Working status (${wsAge}min ago): ${emp.workingStatus}\n`;
+    }
+    if (lastTask) {
+      statusReport += `Latest task [${lastTask.status}]: ${lastTask.description.substring(0, 150)}\n`;
+      if (lastTask.result) statusReport += `Result: ${lastTask.result.substring(0, 300)}\n`;
+    }
+
+    // If working status is recent (< 10 min) and detailed, return it directly — no need to bother the employee
+    if (emp.workingStatus && wsAge !== null && wsAge < 10 && emp.workingStatus.length > 50) {
+      return `${statusReport}\n(Working status is recent — ${wsAge}min ago. Use message_employee if you need to ask them directly.)`;
+    }
+
+    // ── Working status is stale or missing — ask the employee directly ──
+    const questionMsg = `[QUESTION FROM ALFRED — your manager]
+"${question}"
+
+Reply by writing your answer to .agents/comms/${emp.role}-consultation.md AND write an inbox message to Alfred (type: "info") with your key points.
+ALSO update your working status with a detailed summary of your current state:
+  curl -s -X POST http://localhost:3777/api/employees/${emp._id}/self/working-status \\
+    -H "Content-Type: application/json" \\
+    -d '{"status":"DETAILED: what you have done, what you are doing now, blockers, files changed, progress %"}'
+Be specific and concise. Then continue your current work.`;
+
+    // If working or has active session — inject the question as a message
+    const sessionId = emp.currentTask || emp.activeSessionId;
+    if (sessionId) {
+      const injected = claudeCodeService.injectMessage(sessionId, questionMsg);
+      if (injected) {
+        const answer = await this.waitForInboxResponse(employeeId, userId, 180000);
+        return `${statusReport}\n💬 ${emp.avatar} ${emp.name} says:\n${answer}`;
+      }
+    }
+
+    // No active session — assign as a task (wakes them up)
+    const task = `Alfred (your manager) is asking you a question. This is NOT a coding task — it's a consultation.
+
+QUESTION FROM ALFRED:
+"${question}"
+
+YOUR JOB:
+1. Review the current state of the project — read key files, check folder structure, look at docker-compose, review existing code.
+2. Think about this from your role's perspective (${emp.title}).
+3. Write your answer to .agents/comms/${emp.role}-consultation.md with a clear, actionable response.
+4. Be specific — mention exact files, technologies, missing pieces, and concrete next steps.
+5. Do NOT write code — just analyze and advise.
+6. Keep your answer focused and under 500 words.
+7. Update your working status with what you found and your current state.
+
+Write an inbox message to Alfred with type "info" containing your key recommendations.`;
+
+    const result = await new Promise<string>((resolve) => {
+      employeeService.assignTask(userId, employeeId, task, () => {}).then(
+        async () => {
+          const answer = await this.waitForInboxResponse(employeeId, userId, 10000);
+          resolve(answer);
+        },
+        (err) => resolve(`Failed to get answer: ${err.message}`),
+      );
+    });
+
+    return `${statusReport}\n💬 ${emp.avatar} ${emp.name} says:\n${result}`;
+  }
+
+  /** Poll for an inbox response from an employee */
+  private async waitForInboxResponse(employeeId: string, userId: string, timeoutMs: number): Promise<string> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const inbox = await ManagerInbox.find({ employeeId, userId, read: false })
+        .sort({ createdAt: -1 }).limit(1).lean();
+      if (inbox.length > 0 && new Date(inbox[0].createdAt).getTime() > start - 5000) {
+        await ManagerInbox.updateOne({ _id: inbox[0]._id }, { read: true });
+        return `${inbox[0].subject}\n\n${inbox[0].body}`;
+      }
+      await new Promise(r => setTimeout(r, 5000)); // check every 5s
+    }
+    // Fallback: check last task result
+    const fresh = await Employee.findById(employeeId);
+    const lastTask = fresh?.taskHistory[fresh.taskHistory.length - 1];
+    return lastTask?.result?.substring(0, 1500) || 'Employee did not respond in time.';
+  }
+
   private async readEmployeeLogs(employeeId: string, userId: string): Promise<string> {
     const logs = await EmployeeLog.find({ userId, employeeId })
       .sort({ createdAt: -1 })
@@ -1384,6 +1876,240 @@ RULES:
    * If there's an unanswered user message, uses AI to reflect and resume.
    * Also checks if the loop itself died and restarts it.
    */
+  /** Employee self-check: runs at 2x loop. Detects employees who finished but forgot to call task-done */
+  /** Employee self-check: runs at half Alfred's loop. Ensures employees report task results and manage their status */
+  private async employeeSelfCheck(): Promise<void> {
+    try {
+      const user = await User.findOne().sort({ createdAt: 1 });
+      if (!user) return;
+
+      // Check ALL employees with sessions, not just "working" ones
+      const allEmps = await Employee.find({ userId: user._id });
+      if (!allEmps.length) return;
+
+      for (const emp of allEmps) {
+        const sessionId = emp.currentTask || emp.activeSessionId;
+        if (!sessionId) continue;
+
+        const unreportedTasks = emp.taskHistory.filter(t => t.status === 'in_progress');
+        const completedNoResult = emp.taskHistory.filter(t => t.status === 'completed' && !t.result);
+
+        // Nothing pending — skip
+        if (unreportedTasks.length === 0 && completedNoResult.length === 0) continue;
+
+        // Build a purpose-driven prompt
+        const pendingItems: string[] = [];
+
+        for (const t of unreportedTasks) {
+          pendingItems.push(
+            `🔴 IN PROGRESS — "${t.description}" (taskId: ${t.taskId})\n` +
+            `   → If DONE: update your working status with "done" or "idle" in the text.\n` +
+            `   → If NOT DONE: update your working status describing what you're doing.`
+          );
+        }
+
+        for (const t of completedNoResult) {
+          pendingItems.push(
+            `⚠️ COMPLETED BUT NO OUTPUT — "${t.description}" (taskId: ${t.taskId})\n` +
+            `   → Update your working status describing what you did.`
+          );
+        }
+
+        const allTasksDone = unreportedTasks.length === 0;
+        const idleReminder = allTasksDone && emp.status === 'working'
+          ? `\n\nALL TASKS DONE — update your working status with "idle" or "done" in the text to auto-complete.`
+          : '';
+
+        const lastWS = emp.workingStatus
+          ? `\nYour last working status (${emp.workingStatusAt ? new Date(emp.workingStatusAt).toLocaleTimeString() : 'unknown'}): "${emp.workingStatus.substring(0, 200)}"`
+          : '\nYou have NOT updated your working status yet. Do it now.';
+
+        const prompt = `[SELF-CHECK LOOP — ${emp.title}]
+
+You are ${emp.name}, ${emp.title}. This is your periodic self-check. Review your pending items and update your working status.
+
+YOUR PENDING ITEMS (${pendingItems.length}):
+${pendingItems.join('\n\n')}
+${idleReminder}
+${lastWS}
+
+UPDATE YOUR WORKING STATUS NOW (MANDATORY):
+  curl -s -X POST http://localhost:3777/api/employees/${emp._id}/self/working-status -H "Content-Type: application/json" -d '{"status":"Describe what you did, what you are doing now, are you done or stuck? Be detailed."}'
+
+RULES:
+- Include "done" or "idle" in your status text when finished — this auto-completes your tasks.
+- Be DETAILED: what you built, files changed, ports, how to run it, issues found.
+- Alfred reads your working status every 5 minutes to track your progress.
+- This self-check runs every ${Math.round(this.loopIntervalMs / 2 / 60000)} minutes.`;
+
+        claudeCodeService.injectMessage(sessionId, prompt);
+        log('info', `Employee self-check: ${emp.avatar} ${emp.name} — ${unreportedTasks.length} in_progress, ${completedNoResult.length} no-result`);
+      }
+    } catch (err: any) {
+      log('error', `Employee self-check failed: ${err.message}`);
+    }
+  }
+
+  /**
+   * Fast activity check — runs every 5 minutes.
+   * Detects employees who have been working but silent (no log output).
+   * Phase 1 (first check):  Nudge — ask for status update.
+   * Phase 2 (second check): Urgent warning — will restart next time.
+   * Phase 3 (third check):  Auto-restart session and re-assign the same task.
+   * Uses ZERO AI tokens — pure DB queries + session injection.
+   */
+  private async employeeActivityCheck(): Promise<void> {
+    try {
+      const user = await User.findOne().sort({ createdAt: 1 });
+      if (!user) return;
+      const userId = user._id.toString();
+
+      const employees = await Employee.find({ userId, status: 'working' });
+      if (!employees.length) {
+        this.activityNudgeCount.clear();
+        return;
+      }
+
+      const now = new Date();
+      const projects = await Project.find({ userId }).lean();
+
+      for (const emp of employees) {
+        const empId = emp._id.toString();
+        const latestTask = [...emp.taskHistory].reverse().find(t => t.status === 'in_progress');
+        if (!latestTask) continue;
+
+        // Only check if task has been running > 5 min
+        const taskAge = now.getTime() - new Date(latestTask.startedAt).getTime();
+        if (taskAge < this.ACTIVITY_CHECK_MS) continue;
+
+        // ── Check for signs of life: logs OR workingStatus updates ──
+        const lastLog = await EmployeeLog.findOne({
+          userId, employeeId: empId,
+          'metadata.alfredGenerated': { $ne: true },
+        }).sort({ createdAt: -1 }).select('createdAt category content').lean();
+
+        const lastLogAt = lastLog?.createdAt ? new Date(lastLog.createdAt).getTime() : 0;
+        const lastStatusAt = emp.workingStatusAt ? new Date(emp.workingStatusAt).getTime() : 0;
+        const lastActivityAt = emp.lastActivity ? new Date(emp.lastActivity).getTime() : 0;
+
+        // Most recent sign of life: log output OR working status update
+        const lastAliveAt = Math.max(lastLogAt, lastStatusAt, lastActivityAt, new Date(emp.hiredAt).getTime());
+        const silentMs = now.getTime() - lastAliveAt;
+
+        // Still producing output or updating status recently — alive, reset nudge count
+        if (silentMs < this.ACTIVITY_CHECK_MS) {
+          this.activityNudgeCount.delete(empId);
+          continue;
+        }
+
+        const project = projects.find(p => p._id.toString() === emp.projectId.toString());
+        const pName = project?.name || 'Unknown';
+        const silentMin = Math.round(silentMs / 60000);
+        const nudgeCount = this.activityNudgeCount.get(empId) || 0;
+        const sessionId = emp.currentTask || emp.activeSessionId;
+        const lastWS = emp.workingStatus ? `\nLast working status: "${emp.workingStatus.substring(0, 150)}"` : '';
+        const taskDesc = latestTask.description.substring(0, 120);
+
+        const statusCmd = `curl -s -X POST http://localhost:3777/api/employees/${empId}/self/working-status -H "Content-Type: application/json" -d '{"status":"TASK: what you were asked | PROGRESS: done items | CURRENT: what right now | FILES: changed | BLOCKERS: any | STATE: working/stuck/done"}'`;
+
+        if (nudgeCount === 0) {
+          // ── Phase 1: Check-in — evaluate your task and update status ──
+          log('warning', `⏰ ${emp.avatar} ${emp.name} silent ${silentMin}min — activity check`);
+
+          if (sessionId) {
+            claudeCodeService.injectMessage(sessionId,
+              `[ACTIVITY CHECK from Alfred] You've been silent for ${silentMin} minutes.\n` +
+              `Your task: "${taskDesc}"\n\n` +
+              `CHECK NOW and update your working status with FULL DETAIL:\n` +
+              `1. Did you FINISH? → Include "done" and "idle" in your status with a summary of what was completed\n` +
+              `2. Still WORKING? → List what's done (✅), what's pending (⬜), files changed, current action\n` +
+              `3. STUCK? → Describe the exact error/blocker so Alfred can help\n\n` +
+              `  ${statusCmd}`
+            );
+          }
+
+          EmployeeLog.create({
+            userId, employeeId: empId, projectId: emp.projectId.toString(),
+            category: 'text', content: `⏰ Activity check: silent ${silentMin}min — asked to evaluate task${lastWS}`,
+            employeeName: emp.name, employeeAvatar: emp.avatar, employeeRole: emp.role, projectName: pName,
+            metadata: { alfredGenerated: true },
+          }).catch(() => {});
+
+          this.activityNudgeCount.set(empId, 1);
+
+        } else if (nudgeCount === 1) {
+          // ── Phase 2: Urgent — still no self-evaluation, notify Bruce ──
+          log('warning', `⚠️ ${emp.avatar} ${emp.name} still silent after first check — urgent follow-up`);
+
+          if (sessionId) {
+            claudeCodeService.injectMessage(sessionId,
+              `[URGENT from Alfred] You did NOT update your working status after the first check.\n` +
+              `Your task: "${taskDesc}"\n\n` +
+              `You MUST check your work NOW:\n` +
+              `- If the task is DONE: update with "finished" or "idle" in your status\n` +
+              `- If NOT done: describe what's left and keep working\n` +
+              `- If you don't respond, your session will be RESTARTED.\n\n` +
+              `  ${statusCmd}`
+            );
+          }
+
+          telegramService.send(
+            `⚠️ *${emp.name}* on _${pName}_ — no status update for ${silentMin}min.${lastWS}\n` +
+            `Task: "${taskDesc}"\n` +
+            `Will auto-restart if still silent in 5min.`
+          ).catch(() => {});
+
+          EmployeeLog.create({
+            userId, employeeId: empId, projectId: emp.projectId.toString(),
+            category: 'text', content: `⚠️ Second activity check — warned about auto-restart${lastWS}`,
+            employeeName: emp.name, employeeAvatar: emp.avatar, employeeRole: emp.role, projectName: pName,
+            metadata: { alfredGenerated: true },
+          }).catch(() => {});
+
+          this.activityNudgeCount.set(empId, 2);
+
+        } else {
+          // ── Phase 3: Auto-restart — employee is unresponsive, kill session ──
+          log('warning', `🔄 ${emp.avatar} ${emp.name} unresponsive after ${nudgeCount} checks — restarting (no re-task)`);
+
+          try {
+            await employeeService.restartEmployee(userId, empId);
+
+            appendDailyLog(
+              `🔄 Restarted ${emp.name} on ${pName} — silent ${silentMin}min, no status updates.${lastWS}`
+            );
+
+            telegramService.send(
+              `🔄 Restarted *${emp.name}* on _${pName}_ — unresponsive ${silentMin}min.${lastWS}\n` +
+              `Session killed. Employee is now idle. Task was: "${taskDesc}"`
+            ).catch(() => {});
+
+            EmployeeLog.create({
+              userId, employeeId: empId, projectId: emp.projectId.toString(),
+              category: 'text', content: `🔄 Restarted — unresponsive ${silentMin}min after ${nudgeCount} checks. Session killed, now idle.${lastWS}`,
+              employeeName: emp.name, employeeAvatar: emp.avatar, employeeRole: emp.role, projectName: pName,
+              metadata: { alfredGenerated: true },
+            }).catch(() => {});
+          } catch (err: any) {
+            log('error', `Failed to restart ${emp.name}: ${err.message}`);
+            telegramService.send(`❌ Failed to restart *${emp.name}*: ${err.message}`).catch(() => {});
+          }
+
+          this.activityNudgeCount.delete(empId);
+        }
+      }
+
+      // Clean up tracking for employees no longer working
+      for (const empId of this.activityNudgeCount.keys()) {
+        if (!employees.find(e => e._id.toString() === empId)) {
+          this.activityNudgeCount.delete(empId);
+        }
+      }
+    } catch (err: any) {
+      log('error', `Employee activity check failed: ${err.message}`);
+    }
+  }
+
   private async selfHeal(): Promise<void> {
     try {
       // ── 1. Ensure the fast loop is still running ──
@@ -1572,12 +2298,15 @@ RULES:
       snap.workingIds = currentWorking;
 
       // ── 3. Stuck employee detection based on LAST LOG activity ──
-      const SILENT_NUDGE_MS = 5 * 60 * 1000;       // 5min since last log: suspect stuck, nudge
-      const SILENT_RESTART_MS = 10 * 60 * 1000;     // 10min since last log after nudge: force restart
+      // NOTE: The fast 5-min activityCheck handles short-term silence (nudge → warn → restart).
+      // This section handles longer-term stuck detection (stuckNudgeMs, typically hours).
+      // Skip employees already being tracked by the fast activity check to avoid double-nudging.
+      const SILENT_NUDGE_MS = this.stuckNudgeMs;
+      const SILENT_RESTART_MS = this.stuckRestartMs;
 
       // Batch-fetch the latest REAL log timestamp per working employee
       // Excludes Alfred-generated logs (nudges, system messages) so they don't mask a stuck agent
-      const workingEmps = employees.filter(e => e.status === 'working');
+      const workingEmps = employees.filter(e => e.status === 'working' && !this.activityNudgeCount.has(e._id.toString()));
       const lastLogTimes = new Map<string, Date>();
       for (const emp of workingEmps) {
         const lastLog = await EmployeeLog.findOne({
@@ -1618,45 +2347,32 @@ RULES:
           notifications.push(`⏰ *${emp.name}* silent ${Math.round(silentMs / 60000)}min on _${pName}_ — sent check-in`);
         }
 
-        // Phase 2: Still silent > 10min after nudge — force restart (no permission needed)
+        // Phase 2: Still silent after nudge — send stronger message, notify Bruce (do NOT kill session)
         const nudgedAt = snap.nudgedEmployees.get(empId);
         if (nudgedAt && silentMs > SILENT_RESTART_MS && (Date.now() - nudgedAt) > 5 * 60 * 1000) {
-          log('warning', `${emp.avatar} ${emp.name} unresponsive after nudge — force restarting`);
+          log('warning', `${emp.avatar} ${emp.name} unresponsive after nudge — notifying Bruce`);
           snap.nudgedEmployees.delete(empId);
 
-          // Cancel current session
-          if (emp.currentTask) {
-            claudeCodeService.cancelSession(emp.currentTask);
+          // Send a stronger message but keep the session alive
+          const sessionToNudge = emp.currentTask || emp.activeSessionId;
+          if (sessionToNudge) {
+            claudeCodeService.injectMessage(sessionToNudge, `[URGENT from Alfred] You have been unresponsive for ${Math.round(silentMs / 60000)} minutes. Produce output NOW or write to .agents/inbox/ explaining what's happening.`);
           }
+
           const lastTask = emp.taskHistory[emp.taskHistory.length - 1];
           const taskDesc = lastTask?.description || '';
-          if (lastTask?.status === 'in_progress') {
-            lastTask.status = 'failed';
-            lastTask.result = 'Unresponsive — auto-restarted by Alfred';
-            lastTask.completedAt = now;
-          }
-          emp.status = 'idle';
-          emp.currentTask = '';
           emp.lastActivity = now;
           await emp.save();
 
           EmployeeLog.create({
             userId, employeeId: empId, projectId: emp.projectId.toString(),
-            category: 'task_fail', content: `🔄 Auto-restarted by Alfred: unresponsive after nudge`,
+            category: 'text', content: `⚠️ Unresponsive after nudge — Bruce notified`,
             employeeName: emp.name, employeeAvatar: emp.avatar, employeeRole: emp.role, projectName: pName,
             metadata: { alfredGenerated: true },
           }).catch(() => {});
 
-          notifications.push(`🔄 *${emp.name}* unresponsive on _${pName}_ — auto-restarted`);
-          appendDailyLog(`🔄 Auto-restarted ${emp.name}: stuck on "${taskDesc.substring(0, 80)}"`);
-
-          // Re-assign the same task in background
-          if (taskDesc) {
-            employeeService.assignTask(userId, empId, taskDesc, () => {}).then(
-              () => telegramService.send(`✅ *${emp.name}* finished re-run on _${pName}_`).catch(() => {}),
-              (err: any) => telegramService.send(`❌ *${emp.name}* re-run failed: ${err.message}`).catch(() => {}),
-            );
-          }
+          notifications.push(`⚠️ *${emp.name}* unresponsive on _${pName}_ for ${Math.round(silentMs / 60000)}min — "${taskDesc.substring(0, 60)}"\nReply with "restart ${emp.name}" if you want me to restart them.`);
+          appendDailyLog(`⚠️ ${emp.name} unresponsive on "${taskDesc.substring(0, 80)}" — notified Bruce`);
         }
       }
 
@@ -1675,10 +2391,10 @@ RULES:
         telegramService.send(msg).catch(() => {});
         log('info', `Loop: sent ${notifications.length} notification(s)`);
         persistLog('loop', `${notifications.length} notification(s): ${notifications.map(n => n.substring(0, 60)).join(' | ')}`);
-        // Write to daily log
         for (const n of notifications) {
           appendDailyLog(`📢 ${n.replace(/\*/g, '').replace(/_/g, '').substring(0, 150)}`);
         }
+        this.lastNotificationAt = Date.now();
       }
 
       // ── 5b. Process urgent inbox messages (no AI — just forward to Bruce) ──
@@ -1766,26 +2482,79 @@ RULES:
           log('info', 'Loop: proactive AI thinking triggered');
           persistLog('loop', `Proactive scan: ${idleEmployees.length} idle, ${workingNow.length} working, failures: ${hasFailedRecently}`, { userId });
 
+          this.scanCount++;
+
+          // Build strategic context from DB (async)
+          const strategicCtx = await this.buildStrategicCheckContext(projects, idleEmployees);
+
+          // Compute unread task results across all employees
+          const unreadByEmployee: string[] = [];
+          for (const emp of employees) {
+            const unread = emp.taskHistory.filter((t: any) => !t.resultRead && t.result);
+            if (unread.length > 0) {
+              unreadByEmployee.push(`  🔴 ${emp.avatar} ${emp.name}: ${unread.length} unread result(s) — use read_task_results with unread:true, then mark_tasks_read`);
+            }
+          }
+          const unreadSection = unreadByEmployee.length > 0
+            ? `\nUNREAD TASK RESULTS (read these FIRST):\n${unreadByEmployee.join('\n')}\n`
+            : '';
+
           // Build a focused prompt for the proactive scan (with memory context)
           const memoryQuery = `proactive scan: ${idleEmployees.length} idle, ${workingNow.length} working, failures: ${hasFailedRecently}`;
           const context = await this.buildContext(userId, memoryQuery);
-          const scanPrompt = `[PROACTIVE SCAN — this is your 15-minute loop, NOT a message from Bruce]
+          // Compute pending work across all employees
+          const pendingTasks = employees.reduce((n: number, e: any) => n + e.taskHistory.filter((t: any) => t.status === 'in_progress').length, 0);
+          const failedTasks = employees.reduce((n: number, e: any) => n + e.taskHistory.filter((t: any) => t.status === 'failed' && !t.resultRead).length, 0);
 
-You are running your regular patrol. Bruce did NOT send a message — this is you being proactive.
+          // Companies without strategic direction
+          const noDirection = projects.filter(p => !p.onHolding && (!p.strategicDirection || !p.strategicDirection.trim()) && (!p.strategicCycle || p.strategicCycle.status === 'idle'));
+          const noDirectionSection = noDirection.length > 0
+            ? `\n⚠️ COMPANIES WITHOUT DIRECTION (${noDirection.length}):\n${noDirection.map(p => `  - ${p.name} (ID: ${p._id}) — no strategic plan. Suggest to Bruce: set to pending_directions.`).join('\n')}\n`
+            : '';
 
-CURRENT STATUS:
-- Idle employees (ready to work): ${idleEmployees.map(e => `${e.avatar} ${e.name} (${e.role})`).join(', ') || 'None'}
-- Working now: ${workingNow.map(e => `${e.avatar} ${e.name}`).join(', ') || 'None'}
-- Recent failures: ${hasFailedRecently ? 'YES — check notifications above' : 'None'}
-- Nobody working: ${nobodyWorking ? 'YES — all hands idle' : 'No'}
-${notifications.length > 0 ? `\nNOTIFICATIONS THIS TICK:\n${notifications.join('\n')}` : ''}
+          const scanPrompt = `[PROACTIVE SCAN — this is your loop, NOT a message from Bruce]
 
-YOUR JOB RIGHT NOW:
-1. If employees failed a task, investigate WHY (use read_employee_logs) and suggest a fix or retry.
-2. If employees are idle and could be generating revenue, suggest specific tasks to Bruce. ALWAYS ask permission first — say "Bruce, I'd like to put X on Y. Good to go?"
-3. If nobody is working, that's a problem. Suggest what each idle employee should be doing.
-4. Write a brief note to your daily log about what you found.
-5. Keep it SHORT — 2-3 sentences max on Telegram. Bruce is busy.
+You are running your regular patrol. Focus on PENDING WORK — we lose money with unresolved pendencies AND with companies that have no leadership direction.
+
+PENDING WORK:
+- Unread task results: ${unreadByEmployee.length > 0 ? unreadByEmployee.length + ' employee(s) with unread results' : 'None'}
+- Tasks in progress: ${pendingTasks}
+- Unread failures: ${failedTasks}
+- Companies without direction: ${noDirection.length > 0 ? noDirection.length + ' — these are losing money with no plan' : 'None'}
+${unreadSection}${noDirectionSection}${notifications.length > 0 ? `\nNOTIFICATIONS THIS TICK:\n${notifications.join('\n')}` : ''}
+
+YOUR PRIORITIES (in order):
+1. READ unread task results (read_task_results unread:true) — this is how you learn what was done. Then mark_tasks_read.
+2. ACT on results — assign QA after dev completes, assign dev after QA finds bugs, register applications.
+3. UNBLOCK — if anything is stuck, failed, or waiting, resolve it. Send messages, reassign tasks, escalate to Bruce.
+4. DIRECTION — if any company has no strategic direction and no active cycle, suggest to Bruce: "Bruce, [company] has no direction plan. Shall I set it to pending_directions so leadership can define priorities?"
+5. Only message Bruce about things that need his decision. Don't report routine progress — just handle it.
+6. Write a brief note to your daily log about what you found and what you did.
+7. Keep it SHORT — 2-3 sentences max on Telegram. Bruce is busy.
+
+AUTONOMOUS LOOP: dev fails/completes → QA tests → bugs found → dev fixes → QA re-tests. You run this loop WITHOUT asking. Just inform Bruce of outcomes.
+
+EMPLOYEE SESSION RULES (CRITICAL):
+- Employees stay ALIVE after completing a task. They go to "idle" but their session persists.
+- To give an idle employee a new task, just use the "task" action — it sends a message to their existing session.
+- You can NEVER stop an employee. Only Bruce can stop them.
+- If an employee appears stuck, send them a message (message_employee) — do NOT stop or restart them.
+- If you believe an employee needs to be stopped or restarted, ASK BRUCE on Telegram first: "Bruce, should I restart [employee name]?"
+- Only after Bruce confirms, use the restart action.
+
+APPLICATION REGISTRY (your responsibility — keep it up to date):
+- When a developer finishes building an app, ASK THEM (ask_employee) to find the port, service name, and type.
+- IMMEDIATELY register it with add_application (name, port, type, dockerService, purpose, description).
+- After QA tests an app, update it with update_application: set tested=true if it passed, tested=false if bugs were found.
+- **TEST INSTRUCTIONS**: Every application MUST have testInstructions. After QA finishes testing an app, read their exec log and extract the test steps/instructions they used (or should be used). Then update_application with testInstructions containing clear, step-by-step testing instructions. If an app has NO test instructions (shown as "⚠️ NO test instructions" in context), proactively assign a QA Tester to test it and document the test instructions. Bruce checks test instructions in the Applications Registry — keep them thorough and up to date.
+- After QA runs, collect their screenshots with collect_screenshots so Bruce can see them in the Applications Registry.
+- When an app's docker container is started/stopped, update its status accordingly.
+- Keep the purpose field meaningful — it explains WHY the app exists, not WHAT it does technically.
+- The Applications Registry is Bruce's dashboard to see all running services. Keep it accurate.
+
+8. If any application has NO test instructions, assign a QA Tester to test it and document the test steps via update_application testInstructions.
+
+${strategicCtx ? `STRATEGIC ACTION NEEDED:\n${strategicCtx}` : ''}
 
 If everything is genuinely fine and there's nothing actionable, just write to your daily log and say nothing on Telegram.`;
 
@@ -1834,9 +2603,24 @@ If everything is genuinely fine and there's nothing actionable, just write to yo
         snap.reportedFailed = new Set(arr.slice(-200));
       }
 
+      // ── 9. Backoff: if Alfred notified Bruce but got no response, slow down ──
+      if (this.lastNotificationAt > 0 && this.lastUserMsgAt < this.lastNotificationAt) {
+        // Bruce hasn't replied since last notification — back off
+        const maxInterval = this.baseLoopIntervalMs * Math.pow(ManagerService.BACKOFF_FACTOR, ManagerService.MAX_BACKOFF_LOOPS);
+        if (this.loopIntervalMs < maxInterval) {
+          const newInterval = Math.min(this.loopIntervalMs * ManagerService.BACKOFF_FACTOR, maxInterval);
+          this.loopIntervalMs = Math.round(newInterval);
+          log('info', `Loop backoff: Bruce silent since last notification → ${this.getLoopIntervalDisplay()}`);
+          appendDailyLog(`⏳ Loop backoff → ${this.getLoopIntervalDisplay()} (no response from Bruce)`);
+          // Restart intervals with new timing
+          if (this.interval) { clearInterval(this.interval); this.interval = setInterval(() => this.runCheck().catch(() => {}), this.loopIntervalMs); }
+          if (this.employeeCheckInterval) { clearInterval(this.employeeCheckInterval); this.employeeCheckInterval = setInterval(() => this.employeeSelfCheck().catch(() => {}), this.loopIntervalMs / 2); }
+        }
+      }
+
       const working = workingNow.length;
       const idle = idleEmployees.length;
-      log('info', `Loop: ${employees.length} employees (${working} working, ${idle} idle), ${recentErrors} errors/hr`);
+      log('info', `Loop: ${employees.length} employees (${working} working, ${idle} idle), ${recentErrors} errors/hr, interval: ${this.getLoopIntervalDisplay()}`);
     } catch (err: any) {
       log('error', `Loop check failed: ${err.message}`);
       persistLog('error', `Loop crashed: ${err.message}`);

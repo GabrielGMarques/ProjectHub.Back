@@ -1,10 +1,15 @@
 import { Response } from 'express';
 import { AuthRequest } from '../middleware/auth.middleware';
 import { EmployeeService } from '../services/employee.service';
+import { Employee } from '../models/employee.model';
 import { EmployeeLog } from '../models/employee-log.model';
 import { TelemetryService } from '../services/telemetry.service';
+import { ProjectService } from '../services/project.service';
+import { employeeMemoryService } from '../services/employee-memory.service';
+import { wsService } from '../services/websocket.service';
 
 const employeeService = new EmployeeService();
+const projectService = new ProjectService();
 const telemetryService = new TelemetryService();
 
 export class EmployeeController {
@@ -135,6 +140,25 @@ export class EmployeeController {
     res.json(skills);
   }
 
+  /** GET /api/employees/local-skills — discover locally installed Claude Code skills */
+  async getLocalSkills(_req: AuthRequest, res: Response): Promise<void> {
+    const skills = employeeService.getLocalSkills();
+    res.json(skills);
+  }
+
+  /** PUT /api/employees/role-skills/:role — batch set skills for a role (all employees of that type) */
+  async setRoleSkills(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const { role } = req.params;
+      const { skills } = req.body; // array of { name, description, prompt? }
+      if (!Array.isArray(skills)) { res.status(400).json({ error: 'skills array required' }); return; }
+      const result = await employeeService.setRoleSkills(req.userId!, role, skills);
+      res.json(result);
+    } catch (err: any) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+
   async getLogs(req: AuthRequest, res: Response): Promise<void> {
     try {
       const { id } = req.params;
@@ -152,6 +176,226 @@ export class EmployeeController {
       ]);
 
       res.json({ logs, total, page, limit, pages: Math.ceil(total / limit) });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ── Memory endpoints ──
+
+  async getMemories(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const memories = await employeeMemoryService.getMemories(
+        req.params.id,
+        req.query.category as string,
+        parseInt(req.query.limit as string) || 50,
+      );
+      res.json(memories);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+
+  async addMemory(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const { category, content, importance, tags } = req.body;
+      if (!category || !content) { res.status(400).json({ error: 'category and content required' }); return; }
+      const memory = await employeeMemoryService.addMemory(req.userId!, req.params.id, {
+        category, content, importance, tags,
+      });
+      res.json(memory);
+    } catch (err: any) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+
+  async deleteMemory(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      await employeeMemoryService.deleteMemory(req.userId!, req.params.memoryId);
+      res.json({ message: 'Memory deleted' });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+
+  async wipeMemories(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const count = await employeeMemoryService.wipeMemories(req.userId!, req.params.id);
+      res.json({ message: `Wiped ${count} memories` });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+
+  async compactLogs(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const result = await employeeMemoryService.compactLogs(req.userId!, req.params.id);
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+
+  async restartEmployee(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      // Kill session completely
+      const result = await employeeService.restartEmployee(req.userId!, req.params.id);
+      res.json(result);
+    } catch (err: any) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+
+  /** Employee sets their own status (called by the agent via API) */
+  async selfSetStatus(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const { status } = req.body;
+      if (!['idle', 'working'].includes(status)) {
+        res.status(400).json({ error: 'status must be "idle" or "working"' }); return;
+      }
+      const emp = await Employee.findByIdAndUpdate(
+        req.params.id,
+        { status, lastActivity: new Date() },
+        { new: true },
+      );
+      if (!emp) { res.status(404).json({ error: 'Employee not found' }); return; }
+      wsService.employeeStatusChanged(emp._id.toString(), emp.projectId.toString(), status, emp.name);
+      res.json({ message: `Status set to ${status}`, status: emp.status });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+
+  /** Employee marks their current/latest task as done (called by the agent via API) */
+  async selfTaskDone(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const { taskId, result } = req.body;
+      const emp = await Employee.findById(req.params.id);
+      if (!emp) { res.status(404).json({ error: 'Employee not found' }); return; }
+
+      // Find the task — by taskId or the latest in_progress
+      const task = taskId
+        ? emp.taskHistory.find(t => t.taskId === taskId)
+        : emp.taskHistory.filter(t => t.status === 'in_progress').pop();
+
+      if (!task) { res.status(404).json({ error: 'No in_progress task found' }); return; }
+
+      task.status = 'completed';
+      task.completedAt = new Date();
+      if (result) task.result = result.substring(0, 5000);
+
+      // Check if all tasks are done — set to idle
+      const hasInProgress = emp.taskHistory.some(t => t.status === 'in_progress');
+      if (!hasInProgress) {
+        emp.status = 'idle';
+        emp.currentTask = '';
+      }
+      emp.lastActivity = new Date();
+      await emp.save();
+
+      // Log and compact
+      const uid = emp.userId.toString();
+      const project = await projectService.findById(emp.projectId.toString(), uid);
+      EmployeeLog.create({
+        userId: uid, employeeId: emp._id.toString(), projectId: emp.projectId.toString(),
+        category: 'task_complete', content: `✅ Self-reported: ${task.description}`,
+        employeeName: emp.name, employeeAvatar: emp.avatar, employeeRole: emp.role,
+        projectName: project?.name || 'Unknown',
+      }).catch(() => {});
+
+      employeeMemoryService.compactLogs(uid, emp._id.toString()).catch(() => {});
+
+      wsService.employeeTaskUpdate(emp._id.toString(), emp.projectId.toString(), {
+        taskId: task.taskId, status: task.status, result: task.result, description: task.description,
+      });
+      if (!hasInProgress) {
+        wsService.employeeStatusChanged(emp._id.toString(), emp.projectId.toString(), emp.status, emp.name);
+      }
+
+      res.json({
+        message: `Task marked done: ${task.description}`,
+        status: emp.status,
+        allDone: !hasInProgress,
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+
+  /** Employee updates the result/description of a task */
+  async selfTaskUpdate(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const { taskId, result } = req.body;
+      if (!result) { res.status(400).json({ error: 'result is required' }); return; }
+      const emp = await Employee.findById(req.params.id);
+      if (!emp) { res.status(404).json({ error: 'Employee not found' }); return; }
+
+      const task = taskId
+        ? emp.taskHistory.find(t => t.taskId === taskId)
+        : emp.taskHistory[emp.taskHistory.length - 1];
+
+      if (!task) { res.status(404).json({ error: 'Task not found' }); return; }
+
+      task.result = result.substring(0, 5000);
+      await emp.save();
+
+      wsService.employeeTaskUpdate(emp._id.toString(), emp.projectId.toString(), {
+        taskId: task.taskId, status: task.status, result: task.result, description: task.description,
+      });
+      res.json({ message: `Task result updated: ${task.description}`, taskId: task.taskId });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+
+  /** Employee updates their free-text working status (simple alternative to task-done/status calls) */
+  async selfWorkingStatus(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const { status } = req.body;
+      if (!status || typeof status !== 'string') {
+        res.status(400).json({ error: 'status (string) is required' }); return;
+      }
+
+      const emp = await Employee.findById(req.params.id);
+      if (!emp) { res.status(404).json({ error: 'Employee not found' }); return; }
+
+      emp.workingStatus = status.substring(0, 2000);
+      emp.workingStatusAt = new Date();
+      emp.lastActivity = new Date();
+
+      // Auto-detect idle intent from the status text
+      const lowerStatus = status.toLowerCase();
+      const idleSignals = ['idle', 'finished', 'done', 'completed', 'waiting for', 'nothing to do', 'all tasks done'];
+      if (idleSignals.some(s => lowerStatus.includes(s)) && emp.status === 'working') {
+        // Auto-complete in_progress tasks and set idle
+        const inProgressTasks = emp.taskHistory.filter(t => t.status === 'in_progress');
+        for (const task of inProgressTasks) {
+          task.status = 'completed';
+          task.completedAt = new Date();
+          if (!task.result) task.result = status.substring(0, 5000);
+        }
+        emp.status = 'idle';
+        emp.currentTask = '';
+      }
+
+      await emp.save();
+
+      const uid = emp.userId.toString();
+      const project = await projectService.findById(emp.projectId.toString(), uid);
+      EmployeeLog.create({
+        userId: uid, employeeId: emp._id.toString(), projectId: emp.projectId.toString(),
+        category: 'text', content: `📋 Working status: ${status.substring(0, 200)}`,
+        employeeName: emp.name, employeeAvatar: emp.avatar, employeeRole: emp.role,
+        projectName: project?.name || 'Unknown',
+      }).catch(() => {});
+
+      wsService.employeeStatusChanged(emp._id.toString(), emp.projectId.toString(), emp.status, emp.name);
+
+      res.json({
+        message: 'Working status updated',
+        workingStatus: emp.workingStatus,
+        employeeStatus: emp.status,
+      });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }

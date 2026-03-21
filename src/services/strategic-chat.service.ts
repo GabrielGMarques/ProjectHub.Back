@@ -110,6 +110,11 @@ export class StrategicChatService {
 
       if (p.monetizationPlan) summary += `\n- Monetization Plan: ${p.monetizationPlan}`;
 
+      if ((p.applications || []).length > 0) {
+        const appsWithTests = p.applications.filter(a => a.testInstructions).length;
+        summary += `\n- Applications: ${p.applications.length} total, ${appsWithTests} with test instructions`;
+      }
+
       if (p.todos?.length) {
         summary += `\n- Todo List:\n${formatTodos(p.todos)}`;
       }

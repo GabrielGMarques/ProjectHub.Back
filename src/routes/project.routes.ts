@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { ProjectController } from '../controllers/project.controller';
 import { MarketingResearchController } from '../controllers/marketing-research.controller';
 import { ClaudeCodeController } from '../controllers/claude-code.controller';
+import { InfrastructureController } from '../controllers/infrastructure.controller';
 import { authMiddleware } from '../middleware/auth.middleware';
 import { validateProject } from '../middleware/validation.middleware';
 import { body } from 'express-validator';
@@ -11,6 +12,7 @@ const router = Router();
 const controller = new ProjectController();
 const marketingController = new MarketingResearchController();
 const claudeCodeController = new ClaudeCodeController();
+const infraController = new InfrastructureController();
 
 router.use(authMiddleware);
 
@@ -53,6 +55,16 @@ router.delete('/:id/ai/coach/messages', (req: any, res: any) => controller.clear
 router.post('/:id/marketing/research', (req: any, res: any) => marketingController.runFullResearch(req, res));
 router.post('/:id/marketing/research/:step', (req: any, res: any) => marketingController.runStep(req, res));
 router.get('/:id/marketing/latest', (req: any, res: any) => marketingController.getLatest(req, res));
+
+// Applications (per-company services/projects)
+router.post('/:id/applications', (req: any, res: any) => infraController.addApplication(req, res));
+router.put('/:id/applications/:name', (req: any, res: any) => infraController.updateApplication(req, res));
+router.delete('/:id/applications/:name', (req: any, res: any) => infraController.removeApplication(req, res));
+
+// Application screenshots
+router.post('/:id/applications/:name/screenshots', upload.single('file'), (req: any, res: any) => infraController.uploadScreenshot(req, res));
+router.get('/:id/applications/:name/screenshots/:filename', (req: any, res: any) => infraController.getScreenshot(req, res));
+router.delete('/:id/applications/:name/screenshots/:filename', (req: any, res: any) => infraController.deleteScreenshot(req, res));
 
 // Claude Code agent
 router.post('/:id/agent/run', (req: any, res: any) => claudeCodeController.runAgent(req, res));
