@@ -17,6 +17,24 @@ router.get('/:id/self/team', (req: any, res: any) => controller.getSelfTeam(req,
 router.get('/:id/self/teammate/:teammateId', (req: any, res: any) => controller.getSelfTeammateStatus(req, res));
 router.get('/:id/self/direction', (req: any, res: any) => controller.getSelfDirection(req, res));
 router.post('/:id/self/direction', (req: any, res: any) => controller.setSelfDirection(req, res));
+router.get('/:id/self/applications', (req: any, res: any) => controller.getSelfApplications(req, res));
+router.post('/:id/self/applications', (req: any, res: any) => controller.selfUpsertApplication(req, res));
+router.post('/:id/self/applications/:appName/screenshots', (req: any, res: any) => controller.selfUploadScreenshot(req, res));
+router.post('/:id/self/inbox', (req: any, res: any) => controller.selfSendInbox(req, res));
+
+// Catch-all for unknown /self/* routes — return 404 instead of falling through to auth
+router.all('/:id/self/*', (req: any, res: any) => {
+  res.status(404).json({
+    error: 'Unknown self-service endpoint',
+    availableEndpoints: [
+      'POST /self/status', 'POST /self/task-done', 'POST /self/task-update',
+      'POST /self/working-status', 'GET /self/status-history', 'GET /self/team',
+      'GET /self/teammate/:id', 'GET /self/direction', 'POST /self/direction',
+      'GET /self/applications', 'POST /self/applications',
+      'POST /self/applications/:appName/screenshots', 'POST /self/inbox',
+    ],
+  });
+});
 
 // Everything below requires auth
 router.use(authMiddleware);

@@ -119,4 +119,15 @@ export class TelemetryController {
     const records = await tokenUsageService.getRecent(req.userId!, limit);
     res.json(records);
   }
+
+  async getEmployeeTokenUsage(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const { employeeId } = req.params;
+      const limit = parseInt(req.query.limit as string) || 100;
+      const result = await tokenUsageService.getByEmployee(req.userId!, employeeId, limit);
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  }
 }

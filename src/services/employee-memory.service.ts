@@ -24,10 +24,10 @@ export class EmployeeMemoryService {
   }
 
   /** Build a compact context string from employee memories for prompt injection */
-  async buildMemoryContext(employeeId: string): Promise<string> {
+  async buildMemoryContext(employeeId: string, limit = 5): Promise<string> {
     const memories = await EmployeeMemory.find({ employeeId: new Types.ObjectId(employeeId) })
       .sort({ importance: -1, createdAt: -1 })
-      .limit(30)
+      .limit(limit)
       .lean();
 
     if (!memories.length) return '';

@@ -229,4 +229,31 @@ export class TokenUsageService {
       .populate('projectId', 'name')
       .lean();
   }
+
+  /**
+   * Get per-interaction token usage for a specific employee.
+   */
+  async getByEmployee(userId: string, employeeId: string, limit: number = 100): Promise<{
+    records: any[];
+    summary: { totalTokens: number; totalCost: number; totalCalls: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number };
+  }> {
+    const records = await TokenUsage.find({ userId, employeeId })
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .populate('projectId', 'name')
+      .lean();
+
+    const summary = records.reduce((acc, r) => {
+      acc.totalTokens += r.totalTokens || 0;
+      acc.totalCost += r.costUsd || 0;
+      acc.totalCalls += 1;
+      acc.inputTokens += r.inputTokens || 0;
+      acc.outputTokens += r.outputTokens || 0;
+      acc.cacheReadTokens += r.cacheReadTokens || 0;
+      acc.cacheCreationTokens += r.cacheCreationTokens || 0;
+      return acc;
+    }, { totalTokens: 0, totalCost: 0, totalCalls: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 });
+
+    return { records, summary };
+  }
 }

@@ -21,7 +21,7 @@ const employeeLogSchema = new Schema<IEmployeeLog>(
     projectId: { type: Schema.Types.ObjectId, ref: 'Project', required: true },
     category: {
       type: String,
-      enum: ['task_start', 'task_complete', 'task_fail', 'tool_use', 'tool_result', 'text', 'error', 'comms'],
+      enum: ['task_start', 'task_complete', 'task_fail', 'tool_use', 'tool_result', 'text', 'error', 'comms', 'token_usage'],
       required: true,
     },
     employeeName: { type: String, required: true },

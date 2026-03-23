@@ -4,11 +4,12 @@ import crypto from 'crypto';
 import { Project } from '../models/project.model';
 
 export interface ClaudeCodeEvent {
-  type: 'start' | 'text' | 'tool_use' | 'tool_result' | 'error' | 'done' | 'task_idle';
+  type: 'start' | 'text' | 'tool_use' | 'tool_result' | 'error' | 'done' | 'task_idle' | 'token_usage';
   content?: string;
   tool?: string;
   sessionId: string;
   timestamp: Date;
+  tokenUsage?: TokenUsageData;
 }
 
 export interface TokenUsageData {
@@ -121,7 +122,7 @@ export class ClaudeCodeService {
     const baseOptions: any = {
       allowedTools: options?.allowedTools?.length ? options.allowedTools : ['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', 'WebSearch'],
       cwd: resolvedPath,
-      maxTurns: 50,
+      maxTurns: 1200,
       env: sdkEnv,
     };
 
@@ -132,6 +133,21 @@ export class ClaudeCodeService {
 
     let currentPrompt = prompt;
     let resumeId = options?.resumeSdkSessionId;
+
+    // Stuck detection: track last event timestamp, inject nudge if silent too long
+    const STUCK_CHECK_MS = 5 * 60 * 1000; // 5 minutes
+    let lastEventAt = Date.now();
+    const stuckInterval = options?.keepAlive ? setInterval(() => {
+      const silentMs = Date.now() - lastEventAt;
+      if (silentMs >= STUCK_CHECK_MS && ClaudeCodeService.activeSessions.has(sessionId)) {
+        const pending = ClaudeCodeService.pendingMessages.get(sessionId);
+        if (pending && sdkSessionId) {
+          console.log(`[ClaudeCode] Session ${sessionId} silent for ${Math.round(silentMs / 60000)}min — injecting nudge`);
+          pending.push('[SYSTEM NUDGE] You have been silent for 5 minutes. If you are stuck, describe what is blocking you in your working status and try a different approach. If you are waiting for something, state what. Do NOT go idle without updating your working status.');
+          try { ClaudeCodeService.activeSessions.get(sessionId)?.close(); } catch {}
+        }
+      }
+    }, STUCK_CHECK_MS) : null;
 
     try {
       // Loop: run conversation, check for injected messages, resume if needed
@@ -165,18 +181,45 @@ export class ClaudeCodeService {
               const session = ClaudeCodeService.activeSessions.get(sessionId);
               if (session) session.sdkSessionId = sdkSessionId;
             }
-            // Capture token usage from result messages
-            if (message.type === 'result' && message.usage) {
-              const u = message.usage;
-              accumulatedUsage.inputTokens += u.input_tokens || 0;
-              accumulatedUsage.outputTokens += u.output_tokens || 0;
-              accumulatedUsage.cacheReadTokens += u.cache_read_input_tokens || 0;
-              accumulatedUsage.cacheCreationTokens += u.cache_creation_input_tokens || 0;
-              accumulatedUsage.costUsd += message.total_cost_usd || 0;
-              accumulatedUsage.durationMs += message.duration_ms || 0;
-              accumulatedUsage.numTurns += message.num_turns || 0;
-              const modelKeys = Object.keys(message.modelUsage || {});
-              if (modelKeys.length > 0) accumulatedUsage.model = modelKeys[0];
+            lastEventAt = Date.now();
+            // Capture token usage from result messages and emit per-segment event
+            // SDK may put usage in message.usage, message.result.usage, or top-level fields
+            if (message.type === 'result') {
+              console.log(`[ClaudeCode] Result message keys: ${Object.keys(message).join(', ')} | has usage: ${!!message.usage} | has cost: ${!!message.total_cost_usd} | has modelUsage: ${!!message.modelUsage}`);
+            }
+            if (message.type === 'result' && (message.usage || message.total_cost_usd || message.num_turns)) {
+              const u = message.usage || {};
+              const segmentUsage: TokenUsageData = {
+                inputTokens: u.input_tokens || message.input_tokens || 0,
+                outputTokens: u.output_tokens || message.output_tokens || 0,
+                cacheReadTokens: u.cache_read_input_tokens || message.cache_read_input_tokens || 0,
+                cacheCreationTokens: u.cache_creation_input_tokens || message.cache_creation_input_tokens || 0,
+                costUsd: message.total_cost_usd || 0,
+                durationMs: message.duration_ms || message.duration || 0,
+                numTurns: message.num_turns || 1,
+                model: Object.keys(message.modelUsage || {})[0] || message.model || accumulatedUsage.model,
+              };
+              console.log(`[ClaudeCode] Token usage captured: ${segmentUsage.inputTokens} in / ${segmentUsage.outputTokens} out / $${segmentUsage.costUsd.toFixed(4)}`);
+              // Accumulate for final total
+              accumulatedUsage.inputTokens += segmentUsage.inputTokens;
+              accumulatedUsage.outputTokens += segmentUsage.outputTokens;
+              accumulatedUsage.cacheReadTokens += segmentUsage.cacheReadTokens;
+              accumulatedUsage.cacheCreationTokens += segmentUsage.cacheCreationTokens;
+              accumulatedUsage.costUsd += segmentUsage.costUsd;
+              accumulatedUsage.durationMs += segmentUsage.durationMs;
+              accumulatedUsage.numTurns += segmentUsage.numTurns;
+              if (segmentUsage.model) accumulatedUsage.model = segmentUsage.model;
+
+              // Emit per-segment token_usage event so callers can track each interaction
+              const usageEvent: ClaudeCodeEvent = {
+                type: 'token_usage',
+                content: `Segment: ${segmentUsage.inputTokens} in / ${segmentUsage.outputTokens} out / ${segmentUsage.cacheReadTokens} cache | $${segmentUsage.costUsd.toFixed(4)}`,
+                sessionId,
+                timestamp: new Date(),
+                tokenUsage: segmentUsage,
+              };
+              collectedEvents.push(usageEvent);
+              onEvent(usageEvent);
             }
             this.processMessage(message, sessionId, (event) => {
               collectedEvents.push(event);
@@ -226,6 +269,32 @@ export class ClaudeCodeService {
 
         // Keep-alive mode: don't exit, wait for next message
         if (options?.keepAlive && sdkSessionId && status === 'completed') {
+          // Check if the employee actually finished or just ran out of turns.
+          // Look at the last few text events — if none mention "done/complete/idle", auto-continue.
+          const recentTexts = collectedEvents
+            .filter(e => e.type === 'text' && e.content)
+            .slice(-3)
+            .map(e => e.content!.toLowerCase());
+          const looksFinished = recentTexts.some(t =>
+            t.includes('task complete') || t.includes('done and idle') || t.includes('all tasks complete') ||
+            t.includes('waiting for next') || t.includes('task is done') || t.includes('finished all')
+          );
+
+          if (!looksFinished) {
+            // Conversation ended but employee didn't say "done" — hit maxTurns limit
+            console.log(`[ClaudeCode] ⚠️ Session ${sessionId} hit maxTurns (1200) limit — auto-continuing`);
+            const limitEvent: ClaudeCodeEvent = {
+              type: 'error',
+              content: '⚠️ SESSION HIT maxTurns (1200) LIMIT — conversation was stopped by the system, NOT by the employee. Auto-resuming.',
+              sessionId, timestamp: new Date(),
+            };
+            collectedEvents.push(limitEvent);
+            onEvent(limitEvent);
+            currentPrompt = '[SYSTEM] Your conversation was stopped because it hit the 1200-turn limit. Your task is NOT done yet. Continue working from where you left off. Check your working status and keep going. Do NOT start over — pick up exactly where you stopped.';
+            resumeId = sdkSessionId;
+            continue;
+          }
+
           // Emit task_idle event so the employee service marks the task as done
           const idleEvent: ClaudeCodeEvent = {
             type: 'task_idle', content: '💤 Task complete — waiting for next assignment',
@@ -266,6 +335,7 @@ export class ClaudeCodeService {
       }
     } finally {
       clearTimeout(timer);
+      if (stuckInterval) clearInterval(stuckInterval);
       ClaudeCodeService.activeSessions.delete(sessionId);
       ClaudeCodeService.pendingMessages.delete(sessionId);
       const doneEvent: ClaudeCodeEvent = { type: 'done', sessionId, timestamp: new Date() };

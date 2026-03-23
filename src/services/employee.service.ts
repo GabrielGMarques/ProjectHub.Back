@@ -11,6 +11,7 @@ import { ProjectService } from './project.service';
 import { employeeMemoryService } from './employee-memory.service';
 import { wsService } from './websocket.service';
 import { TokenUsageService } from './token-usage.service';
+import { WorkingStatusHistory } from '../models/working-status-history.model';
 
 const claudeCodeService = new ClaudeCodeService();
 const telegramService = telegramBot;
@@ -139,7 +140,7 @@ const projectService = new ProjectService();
 
 function empLog(
   userId: string, employeeId: string, projectId: string,
-  category: 'task_start' | 'task_complete' | 'task_fail' | 'tool_use' | 'tool_result' | 'text' | 'error' | 'comms',
+  category: 'task_start' | 'task_complete' | 'task_fail' | 'tool_use' | 'tool_result' | 'text' | 'error' | 'comms' | 'token_usage',
   content: string,
   emp: { name: string; avatar: string; role: string },
   projectName: string,
@@ -440,7 +441,21 @@ export class EmployeeService {
 
     // Build skills context — employee's assigned skills + discovered local Claude Code skills
     const skillsCtx = this.buildSkillsContext(employee, cwd);
-    const memoryCtx = await employeeMemoryService.buildMemoryContext(employee._id.toString());
+    const memoryCtx = await employeeMemoryService.buildMemoryContext(employee._id.toString(), 5);
+
+    // Fetch recent working status history so employee can pick up context without resuming old sessions
+    const recentStatuses = await WorkingStatusHistory.find({ employeeId: employee._id })
+      .sort({ createdAt: -1 })
+      .limit(5)
+      .lean();
+    const statusHistoryCtx = recentStatuses.length > 0
+      ? `\nYOUR RECENT WORKING STATUS HISTORY (most recent first — use this to understand where you left off):\n${
+          recentStatuses.map((s, i) => {
+            const ago = Math.round((Date.now() - new Date(s.createdAt).getTime()) / 60000);
+            return `--- ${ago}min ago ---\n${s.content.substring(0, 1200)}`;
+          }).join('\n\n')
+        }\n`
+      : '';
 
     // Build applications context
     const appsCtx = (project.applications || []).length > 0
@@ -556,9 +571,12 @@ Your #1 job after ANY progress is to UPDATE YOUR WORKING STATUS. Everything else
 1. UPDATE WORKING STATUS (after every significant action — this is how Alfred knows what's happening)
 2. Check ${commsDir}/ for messages from teammates before starting work
 3. If you need help from another role: write ${commsDir}/${employee.role}-to-<target-role>.md
-4. If STUCK or need a DECISION: write an inbox message to ${normCwd}/.agents/inbox/alfred-${employee.role}-${taskId}.json
-   Format: {"type":"issue"|"question","subject":"...","body":"..."}
-   Only write inbox for issues/questions — Alfred reads your working status for everything else.
+4. If STUCK or need a DECISION: send a message to Alfred via the inbox API:
+   curl -s -X POST http://localhost:3777/api/employees/${employee._id}/self/inbox \\
+     -H "Content-Type: application/json" \\
+     -d '{"type":"issue","subject":"SHORT SUMMARY","body":"DETAILED DESCRIPTION"}'
+   Types: "issue" (blocker), "question" (need input), "info" (FYI), "completion" (done report)
+   This is the PREFERRED way to contact Alfred — it goes directly to his inbox.
 
 WORKING STATUS — YOUR #1 RESPONSIBILITY:
 Alfred reads your working status to know what you're doing. He checks every 5 minutes.
@@ -585,6 +603,26 @@ HOW TO UPDATE (2-step process to avoid permission issues):
     Returns the company's strategic direction + direction history. Align your work with this.
     curl -s http://localhost:3777/api/employees/${employee._id}/self/team
     Lists all employees in your company and their current status.
+
+  APPLICATION MANAGEMENT (CRITICAL — use these to manage company apps):
+    LIST all apps & used ports:
+      curl -s http://localhost:3777/api/employees/${employee._id}/self/applications
+      Returns: { applications: [...], usedPorts: [3001, 3002, ...] }
+      ALWAYS check this BEFORE choosing a port — pick one that is NOT in usedPorts.
+
+    CREATE or UPDATE an application:
+      curl -s -X POST http://localhost:3777/api/employees/${employee._id}/self/applications \\
+        -H "Content-Type: application/json" \\
+        -d '{"name":"my-app","port":3005,"type":"frontend","status":"running","dockerService":"my-app","description":"...","testInstructions":"...","tested":true}'
+      If the app name already exists, it UPDATES it. If not, it CREATES it.
+      Update the app status to "running" when it starts, "stopped" when it stops, "building" during build.
+      Update testInstructions with detailed test cases after testing.
+
+    UPLOAD a screenshot:
+      curl -s -X POST http://localhost:3777/api/employees/${employee._id}/self/applications/<app-name>/screenshots \\
+        -H "Content-Type: application/json" \\
+        -d '{"filePath":"/absolute/path/to/screenshot.png","caption":"Login page after submit"}'
+      Upload test screenshots so they appear in the application card on the frontend.
 
   SIMPLEST FALLBACK (if curl still fails — just write the .md file):
     Write your status directly to: ${normCwd}/.agents/status/${employee.role}.md
@@ -659,7 +697,7 @@ TASK COMPLETION (2-step — write JSON file then curl it):
     Write "STATE: done and idle" in: ${normCwd}/.agents/status/${employee.role}.md
 
 ${skillsCtx}
-${memoryCtx}
+${memoryCtx}${statusHistoryCtx}
 YOUR TASK:
 ${task}`;
 
@@ -699,8 +737,27 @@ ${task}`;
           empLog(userId, eId, pId, 'error', `⚠️ Permission block detected — ${fixStatus}. Issues: ${check.issues.join('; ') || 'none'}`, empInfo, pName);
           telegramBot.send(`⚠️ *${employee.name}* is blocked by permissions on _${pName}_. Config ${check.fixed ? 'fixed' : 'OK'} — restart employee to apply: tell Alfred "restart ${employee.name}"`).catch(() => {});
         }
+      } else if (event.type === 'token_usage' && event.tokenUsage) {
+        // Record every conversation segment's token usage individually
+        const tu = event.tokenUsage;
+        tokenUsageService.record({
+          userId, employeeId: eId, projectId: pId,
+          source: 'employee',
+          aiModel: tu.model,
+          inputTokens: tu.inputTokens,
+          outputTokens: tu.outputTokens,
+          cacheReadTokens: tu.cacheReadTokens,
+          cacheCreationTokens: tu.cacheCreationTokens,
+          costUsd: tu.costUsd,
+          durationMs: tu.durationMs,
+          numTurns: tu.numTurns,
+          metadata: { taskId, employeeName: employee.name, employeeRole: employee.role, segment: true },
+        });
+        empLog(userId, eId, pId, 'token_usage',
+          `💰 ${tu.inputTokens} in / ${tu.outputTokens} out / ${tu.cacheReadTokens} cache | $${tu.costUsd.toFixed(4)} | ${tu.numTurns} turns`,
+          empInfo, pName, { tokenUsage: tu });
       } else if (event.type === 'text') {
-        empLog(userId, eId, pId, 'text', (event.content || '').substring(0, 1000), empInfo, pName);
+        empLog(userId, eId, pId, 'text', (event.content || '').substring(0, 1200), empInfo, pName);
       } else if (event.type === 'error') {
         empLog(userId, eId, pId, 'error', event.content || 'Unknown error', empInfo, pName);
       }
@@ -729,16 +786,16 @@ ${task}`;
           await Employee.findByIdAndUpdate(employeeId, { lastActivity: new Date() });
         }
 
-        const currentPrompt = isRetry && lastSdkSessionId
-          ? `You were working on a task but got interrupted. Continue where you left off. The original task was:\n\n${task}\n\nPick up from where you stopped. Check your recent work and continue.`
+        // Always start fresh — never resume old sessions (saves ~20M cache tokens).
+        // The employee gets context from working status history injected in the prompt.
+        const currentPrompt = isRetry
+          ? `You were working on a task but got interrupted. Continue where you left off. Check your working status history and the project files to understand where you stopped. The original task was:\n\n${task}\n\nPick up from where you stopped — do NOT start over.`
           : prompt;
-
-        const resumeId = isRetry ? lastSdkSessionId : undefined;
 
         try {
           const result = await claudeCodeService.runCommand(cwd, currentPrompt, eventHandler, {
             allowedTools: SDK_ALLOWED_TOOLS,
-            resumeSdkSessionId: resumeId || employee.sdkSessionId || undefined,
+            // No resumeSdkSessionId — always fresh session to avoid 20M+ cache costs
             keepAlive: true,
             mcpServers: {
               playwright: { command: 'npx', args: ['@playwright/mcp@latest'] },
@@ -747,22 +804,8 @@ ${task}`;
 
           if (result.sdkSessionId) lastSdkSessionId = result.sdkSessionId;
 
-          // Record token usage
-          if (result.tokenUsage) {
-            tokenUsageService.record({
-              userId, employeeId: eId, projectId: pId,
-              source: 'employee',
-              aiModel: result.tokenUsage.model,
-              inputTokens: result.tokenUsage.inputTokens,
-              outputTokens: result.tokenUsage.outputTokens,
-              cacheReadTokens: result.tokenUsage.cacheReadTokens,
-              cacheCreationTokens: result.tokenUsage.cacheCreationTokens,
-              costUsd: result.tokenUsage.costUsd,
-              durationMs: result.tokenUsage.durationMs,
-              numTurns: result.tokenUsage.numTurns,
-              metadata: { taskId, employeeName: employee.name, employeeRole: employee.role },
-            });
-          }
+          // Token usage is recorded per-segment via token_usage events in the event handler above.
+          // No need to record again here — avoids double-counting.
 
           if (result.status === 'completed') {
             finalStatus = 'completed';
@@ -914,7 +957,7 @@ ${task}`;
 
     if (injected) {
       empLog(userId, employee._id.toString(), employee.projectId.toString(), 'text',
-        `📩 Gordon message injected: ${message}`, empInfo, pName, { injected: true });
+        `📩 Alfred message injected: ${message}`, empInfo, pName, { injected: true });
       return { delivered: true, detail: `Message delivered to ${employee.name} mid-execution` };
     }
 
@@ -926,10 +969,10 @@ ${task}`;
       if (cwd) {
         const commsDir = path.join(cwd, '.agents', 'comms');
         if (!fs.existsSync(commsDir)) fs.mkdirSync(commsDir, { recursive: true });
-        const urgentFile = path.join(commsDir, `URGENT-gordon-${Date.now()}.md`);
-        fs.writeFileSync(urgentFile, `# Urgent Message from Gordon\n\n**Time**: ${new Date().toISOString()}\n**To**: ${employee.name}\n\n${message}\n`, 'utf-8');
+        const urgentFile = path.join(commsDir, `URGENT-alfred-${Date.now()}.md`);
+        fs.writeFileSync(urgentFile, `# Urgent Message from Alfred (your manager)\n\n**Time**: ${new Date().toISOString()}\n**To**: ${employee.name}\n\n${message}\n`, 'utf-8');
         empLog(userId, employee._id.toString(), employee.projectId.toString(), 'comms',
-          `📩 Gordon urgent message written to comms (session not found for direct injection): ${message}`, empInfo, pName);
+          `📩 Alfred urgent message written to comms (session not found for direct injection): ${message}`, empInfo, pName);
         return { delivered: true, detail: `Message written to comms for ${employee.name} (will be picked up when agent checks comms)` };
       }
     }
@@ -1009,7 +1052,8 @@ INSTRUCTIONS:
    - If your tasks are DONE: set status to "done and idle"
    - If tasks are UNFINISHED: describe what's left and CONTINUE WORKING on them
 4. DO NOT redo work that's already done. Check what exists first (ls the project root).
-5. DO NOT read .agents/ files — your task history and status history have everything.`;
+5. DO NOT read .agents/ files — your task history and status history have everything.
+6. Check if CLAUDE.md exists in the project root. If NOT, create it: explore the codebase and write project purpose, tech stack, folder structure, build/run instructions, conventions, and env vars.`;
 
     this.assignTask(userId, employeeId, selfEvalTask, () => {}).catch(() => {});
 
@@ -1192,6 +1236,65 @@ INSTRUCTIONS:
     // Level 3: Auto-provision helper scripts
     this.ensureWriteFileHelper(cwd);
     this.ensureApiHelper(cwd);
+
+    // Level 4: Auto-provision custom skills from ~/.claude/skills/ into project
+    this.ensureCustomSkills(cwd);
+  }
+
+  /** Copy custom skills from ~/.claude/skills/ into the project's .claude/skills/ so SDK sessions can use them */
+  private ensureCustomSkills(cwd: string): void {
+    try {
+      const home = process.env.USERPROFILE || process.env.HOME || '';
+      const globalSkillsDir = path.join(home, '.claude', 'skills');
+      if (!fs.existsSync(globalSkillsDir)) return;
+
+      const projectSkillsDir = path.join(cwd, '.claude', 'skills');
+
+      // Copy each skill directory
+      const entries = fs.readdirSync(globalSkillsDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const srcDir = path.join(globalSkillsDir, entry.name);
+        const srcSkillFile = path.join(srcDir, 'SKILL.md');
+
+        // Only copy directories that contain a SKILL.md (actual skills, not data/scripts)
+        if (!fs.existsSync(srcSkillFile)) continue;
+
+        // Copy to both .claude/skills/ and root skills/ — agents look in both locations
+        const destinations = [
+          path.join(projectSkillsDir, entry.name),
+          path.join(cwd, 'skills', entry.name),
+        ];
+
+        for (const destDir of destinations) {
+          const destSkillFile = path.join(destDir, 'SKILL.md');
+          // Skip if already exists and SKILL.md hasn't changed
+          if (fs.existsSync(destSkillFile)) {
+            try {
+              const srcStat = fs.statSync(srcSkillFile);
+              const destStat = fs.statSync(destSkillFile);
+              if (srcStat.mtimeMs <= destStat.mtimeMs) continue;
+            } catch { /* re-copy on error */ }
+          }
+          this.copyDirRecursive(srcDir, destDir);
+        }
+      }
+    } catch { /* non-critical — don't break employee startup */ }
+  }
+
+  /** Recursively copy a directory */
+  private copyDirRecursive(src: string, dest: string): void {
+    if (!fs.existsSync(dest)) fs.mkdirSync(dest, { recursive: true });
+    const entries = fs.readdirSync(src, { withFileTypes: true });
+    for (const entry of entries) {
+      const srcPath = path.join(src, entry.name);
+      const destPath = path.join(dest, entry.name);
+      if (entry.isDirectory()) {
+        this.copyDirRecursive(srcPath, destPath);
+      } else {
+        fs.copyFileSync(srcPath, destPath);
+      }
+    }
   }
 
   /** Level 1-2: Create/update .claude/settings.local.json in the project cwd so agents can run without permission blocks */

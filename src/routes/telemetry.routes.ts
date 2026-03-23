@@ -15,5 +15,6 @@ router.get('/manager-logs', (req: any, res: any) => controller.getManagerLogs(re
 router.get('/employee-logs', (req: any, res: any) => controller.getEmployeeLogs(req, res));
 router.get('/token-usage', (req: any, res: any) => controller.getTokenUsage(req, res));
 router.get('/token-usage/recent', (req: any, res: any) => controller.getRecentTokenUsage(req, res));
+router.get('/token-usage/employee/:employeeId', (req: any, res: any) => controller.getEmployeeTokenUsage(req, res));
 
 export default router;

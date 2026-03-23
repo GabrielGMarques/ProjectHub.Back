@@ -84,6 +84,7 @@ export async function claudeChat(opts: ProxyOptions & { timeoutMs?: number; retr
     }
   }
 
+  console.error(`[ClaudeProxy] All ${maxRetries + 1} attempts failed. Last error: ${lastError?.message}`);
   throw lastError || new Error('Claude chat failed after retries');
 }
 
@@ -119,13 +120,16 @@ async function doQuery(opts: ProxyOptions): Promise<string> {
   const sdkEnv: Record<string, string | undefined> = { ...process.env };
   delete sdkEnv.ANTHROPIC_API_KEY;
 
+  const queryOpts: any = {
+    allowedTools: [],   // chat only, no tools
+    maxTurns: 1,        // single response
+    env: sdkEnv,
+  };
+  if (opts.model) queryOpts.model = opts.model;
+
   const conversation = queryFn({
     prompt,
-    options: {
-      allowedTools: [],   // chat only, no tools
-      maxTurns: 1,        // single response
-      env: sdkEnv,
-    },
+    options: queryOpts,
   });
 
   let result = '';

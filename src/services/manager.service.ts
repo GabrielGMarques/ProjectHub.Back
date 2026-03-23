@@ -168,7 +168,7 @@ export class ManagerService {
    * Debounced to 15s so multiple rapid updates don't cause a flood of AI calls.
    * Triggers a proactive scan (runCheck) so Alfred processes the new info immediately.
    */
-  onEmployeeEvent(employeeName: string, event: 'task_done' | 'status_update' | 'idle'): void {
+  onEmployeeEvent(employeeName: string, event: 'task_done' | 'status_update' | 'idle' | 'inbox_message'): void {
     if (!this.running) return;
 
     log('info', `Reactive: ${employeeName} → ${event}, scheduling wake-up in ${ManagerService.REACTIVE_DELAY_MS / 1000}s`);
@@ -220,31 +220,53 @@ export class ManagerService {
     log('info', `Manager loop started — checking every ${loopMin}min, watchdog every 30min`);
 
     // Seed snapshot with existing task IDs so first run doesn't dump all history
-    this.seedSnapshot().then(() => {
-      this.runCheck().catch(() => {});
-    });
+    this.seedSnapshot().catch(() => {});
 
     this.interval = setInterval(() => this.runCheck().catch(() => {}), this.loopIntervalMs);
     this.watchdogInterval = setInterval(() => this.selfHeal().catch(() => {}), this.watchdogIntervalMs);
     this.employeeCheckInterval = setInterval(() => this.employeeSelfCheck().catch(() => {}), this.loopIntervalMs / 2);
-    this.activityCheckInterval = setInterval(() => this.employeeActivityCheck().catch(() => {}), this.ACTIVITY_CHECK_MS);
+    // Activity check disabled — was causing premature restarts
+    // this.activityCheckInterval = setInterval(() => this.employeeActivityCheck().catch(() => {}), this.ACTIVITY_CHECK_MS);
 
     // ── Stale employees: just set them idle, do NOT auto-restart with self-evaluation ──
     this.resetStaleEmployees().catch(err => {
       log('error', `Stale employee reset failed: ${err.message}`);
     });
 
-    // ── Wake-up sequence: recall purpose + memories, brief Bruce ──
-    appendDailyLog('🚀 Alfred online — loop started');
-    this.wakeUp().catch(err => {
-      log('error', `Wake-up failed: ${err.message}`);
-      // Fallback to simple message
+    // ── Smart start: skip expensive wakeUp + runCheck if Alfred was active recently ──
+    this.smartStart().catch(err => {
+      log('error', `Smart start failed: ${err.message}`);
       telegramService.send('🟢 Alfred online, Bruce. Watching all companies.').catch(() => {});
     });
   }
 
   /**
-   * Wake-up routine — runs once on startup.
+   * Smart start: check if Alfred was active recently to avoid expensive wake-up.
+   * If active within 1 hour → skip wakeUp + initial runCheck (saves ~10K+ tokens).
+   * The regular loop will pick up naturally at the next interval.
+   */
+  private async smartStart(): Promise<void> {
+    const WARM_RESTART_MS = 60 * 60 * 1000; // 1 hour
+    const lastLog = await ManagerLog.findOne().sort({ createdAt: -1 }).lean();
+    const lastLogAge = lastLog ? Date.now() - new Date(lastLog.createdAt).getTime() : Infinity;
+
+    if (lastLogAge < WARM_RESTART_MS) {
+      // Warm restart — Alfred was active recently, skip ALL AI calls (zero tokens)
+      log('info', `Warm restart — last activity ${Math.round(lastLogAge / 60000)}min ago, skipping wakeUp (zero tokens)`);
+      appendDailyLog(`🔄 Alfred warm-restarted (${Math.round(lastLogAge / 60000)}min since last activity)`);
+      await this.seedSnapshot();
+      // No AI call, no Telegram spam — just silently resume. Loop handles the rest.
+      return;
+    }
+
+    // Cold start (1h+ since last activity) — do full wakeUp
+    appendDailyLog('🚀 Alfred online — cold start, running full wake-up');
+    await this.seedSnapshot();
+    await this.wakeUp();
+  }
+
+  /**
+   * Wake-up routine — runs once on COLD startup.
    * Reads purpose.md, recalls relevant memories about blockers/issues,
    * scans current state, and sends Bruce a proactive briefing
    * with what Alfred intends to work on.
@@ -548,8 +570,8 @@ Be Alfred. Be sharp. Hit the ground running.`;
       }
 
       // Save ONLY Alfred's own analysis to memory
-      await this.saveMessage(userId, 'assistant', (finalClean || finalResponse).substring(0, 500));
-      persistLog('message', finalClean || finalResponse.substring(0, 500), { direction: 'outbound', userId });
+      await this.saveMessage(userId, 'assistant', (finalClean || finalResponse).substring(0, 1200));
+      persistLog('message', finalClean || finalResponse.substring(0, 1200), { direction: 'outbound', userId });
       appendDailyLog(`🤖 Alfred: ${(finalClean || finalResponse).substring(0, 200)}`);
       log('ai', (finalClean || finalResponse).substring(0, 200));
 
@@ -711,6 +733,13 @@ Be Alfred. Be sharp. Hit the ground running.`;
       ctx += `  You are in VERBOSE mode. Include employee statuses, task descriptions, and message details in your responses.\n`;
     }
     ctx += `  Bruce can switch modes: /chat or /verbose\n\n`;
+
+    ctx += `BEFORE ASSIGNING ANY TASK (CRITICAL):\n`;
+    ctx += `  When Bruce asks a question about an employee or company:\n`;
+    ctx += `  1. FIRST: read_employee_status for the relevant employee(s) — check if their latest working status already answers Bruce's question.\n`;
+    ctx += `  2. If the working status answers the question → respond with the answer. Do NOT assign a new task.\n`;
+    ctx += `  3. If the working status does NOT answer the question → THEN consider assigning a task or asking the employee.\n`;
+    ctx += `  NEVER skip reading the working status. NEVER assign a task when the answer is already in the status report.\n\n`;
 
     // Companies — separate active vs on-holding
     const activeProjects = projects.filter(p => !p.onHolding);
@@ -1127,10 +1156,13 @@ RULES:
 
   private async callAI(systemPrompt: string, messages: { role: 'user' | 'assistant'; content: string }[], userId?: string): Promise<string> {
     // 90s timeout for manager responses — keeps Telegram responsive
+    // Use Sonnet for Alfred — faster and cheaper than Opus
     const result = await claudeChat({
       system: systemPrompt,
       messages: messages.map(m => ({ role: m.role, content: m.content })),
-      timeoutMs: 90_000,
+      timeoutMs: 120_000,
+      retries: 3,
+      model: 'sonnet',
     });
 
     // Record token usage from this call
@@ -2104,12 +2136,16 @@ ${task}`;
     }
 
     // ── Working status is stale or missing — ask the employee directly ──
-    const questionMsg = `[QUESTION FROM ALFRED — your manager]
+    const questionMsg = `[MESSAGE FROM ALFRED — YOUR MANAGER (not from any other employee)]
+Alfred is asking you directly:
 "${question}"
 
-Reply by writing your answer to .agents/comms/${emp.role}-consultation.md AND write an inbox message to Alfred (type: "info") with your key points.
-ALSO update your working status by writing to: .agents/status/${emp.role}.md
-Be specific and concise. Then continue your current work.`;
+HOW TO RESPOND — use the inbox API endpoint:
+  curl -s -X POST http://localhost:3777/api/employees/${emp._id}/self/inbox \\
+    -H "Content-Type: application/json" \\
+    -d '{"type":"info","subject":"Re: Alfred question","body":"YOUR DETAILED ANSWER HERE"}'
+
+This sends your reply directly to Alfred. Be specific and concise. Then continue your current work.`;
 
     // If working or has active session — inject the question as a message
     const sessionId = emp.currentTask || emp.activeSessionId;
@@ -2122,7 +2158,8 @@ Be specific and concise. Then continue your current work.`;
     }
 
     // No active session — assign as a task (wakes them up)
-    const task = `Alfred (your manager) is asking you a question. This is NOT a coding task — it's a consultation.
+    const task = `[MESSAGE FROM ALFRED — YOUR MANAGER (not from any other employee)]
+Alfred (your manager) is asking you a question. This is NOT a coding task — it's a consultation.
 
 QUESTION FROM ALFRED:
 "${question}"
@@ -2130,13 +2167,16 @@ QUESTION FROM ALFRED:
 YOUR JOB:
 1. Review the current state of the project — read key files, check folder structure, look at docker-compose, review existing code.
 2. Think about this from your role's perspective (${emp.title}).
-3. Write your answer to .agents/comms/${emp.role}-consultation.md with a clear, actionable response.
-4. Be specific — mention exact files, technologies, missing pieces, and concrete next steps.
-5. Do NOT write code — just analyze and advise.
-6. Keep your answer focused and under 500 words.
-7. Update your working status with what you found and your current state.
+3. Be specific — mention exact files, technologies, missing pieces, and concrete next steps.
+4. Do NOT write code — just analyze and advise.
+5. Keep your answer focused and under 500 words.
 
-Write an inbox message to Alfred with type "info" containing your key recommendations.`;
+HOW TO RESPOND (MANDATORY — use the inbox API):
+  curl -s -X POST http://localhost:3777/api/employees/${emp._id}/self/inbox \\
+    -H "Content-Type: application/json" \\
+    -d '{"type":"info","subject":"Re: Alfred question","body":"YOUR DETAILED ANSWER"}'
+
+This sends your reply directly to Alfred's inbox. Then mark yourself idle.`;
 
     const result = await new Promise<string>((resolve) => {
       employeeService.assignTask(userId, employeeId, task, () => {}).then(
@@ -3051,11 +3091,15 @@ RULES:
       const hasIdleWorkers = idleEmployees.length > 0;
       const nobodyWorking = workingNow.length === 0 && employees.length > 0;
 
+      // Check for unread inbox messages (info type — employee responses to Alfred)
+      const unreadInfoInbox = await ManagerInbox.countDocuments({ userId, read: false, type: { $in: ['info', 'completion'] } });
+      const hasUnreadInbox = unreadInfoInbox > 0;
+
       // Trigger proactive thinking when there's something to act on
-      if (hasIdleWorkers || hasFailedRecently || nobodyWorking) {
+      if (hasIdleWorkers || hasFailedRecently || nobodyWorking || hasUnreadInbox) {
         try {
-          log('info', 'Loop: proactive AI thinking triggered');
-          persistLog('loop', `Proactive scan: ${idleEmployees.length} idle, ${workingNow.length} working, failures: ${hasFailedRecently}`, { userId });
+          log('info', `Loop: proactive AI thinking triggered (idle: ${idleEmployees.length}, inbox: ${unreadInfoInbox})`);
+          persistLog('loop', `Proactive scan: ${idleEmployees.length} idle, ${workingNow.length} working, failures: ${hasFailedRecently}, inbox: ${unreadInfoInbox}`, { userId });
 
           this.scanCount++;
 

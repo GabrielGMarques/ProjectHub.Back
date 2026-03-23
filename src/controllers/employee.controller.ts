@@ -1,3 +1,5 @@
+import fs from 'fs';
+import path from 'path';
 import { Response } from 'express';
 import { AuthRequest } from '../middleware/auth.middleware';
 import { EmployeeService } from '../services/employee.service';
@@ -12,6 +14,10 @@ import { WorkingStatusHistory } from '../models/working-status-history.model';
 import { DirectionHistory } from '../models/direction-history.model';
 import { Project } from '../models/project.model';
 import { managerService } from '../services/manager.service';
+import { InfrastructureService } from '../services/infrastructure.service';
+import { ManagerInbox } from '../models/manager-inbox.model';
+
+const infraService = new InfrastructureService();
 
 const employeeService = new EmployeeService();
 const projectService = new ProjectService();
@@ -582,6 +588,148 @@ export class EmployeeController {
         workingStatus: emp.workingStatus,
         employeeStatus: emp.status,
       });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ── Self-service: Application management (no auth — called by employee agents) ──
+
+  /** GET /employees/:id/self/applications — list all apps in the employee's company with ports */
+  async getSelfApplications(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const emp = await Employee.findById(req.params.id).select('projectId').lean();
+      if (!emp) { res.status(404).json({ error: 'Employee not found' }); return; }
+      const project = await Project.findById(emp.projectId).select('name applications').lean();
+      if (!project) { res.status(404).json({ error: 'Project not found' }); return; }
+      res.json({
+        companyName: project.name,
+        companyId: (project as any)._id.toString(),
+        applications: (project.applications || []).map((a: any) => ({
+          name: a.name, port: a.port, type: a.type, status: a.status,
+          dockerService: a.dockerService, basePath: a.basePath,
+          description: a.description, purpose: a.purpose,
+          tested: a.tested, testInstructions: a.testInstructions || '',
+          screenshotCount: (a.screenshots || []).length,
+        })),
+        usedPorts: (project.applications || []).map((a: any) => a.port),
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+
+  /** POST /employees/:id/self/applications — create or update an application */
+  async selfUpsertApplication(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const emp = await Employee.findById(req.params.id).select('projectId userId').lean();
+      if (!emp) { res.status(404).json({ error: 'Employee not found' }); return; }
+      const { name, port, type, status, dockerService, description, purpose, testInstructions, tested, basePath } = req.body;
+      if (!name) { res.status(400).json({ error: 'name is required' }); return; }
+
+      const userId = emp.userId.toString();
+      const projectId = emp.projectId.toString();
+      const project = await Project.findById(projectId).lean();
+      if (!project) { res.status(404).json({ error: 'Project not found' }); return; }
+
+      const existing = (project.applications || []).find((a: any) => a.name === name);
+      if (existing) {
+        // Update
+        const updates: any = {};
+        if (port !== undefined) updates.port = port;
+        if (type !== undefined) updates.type = type;
+        if (status !== undefined) updates.status = status;
+        if (dockerService !== undefined) updates.dockerService = dockerService;
+        if (description !== undefined) updates.description = description;
+        if (purpose !== undefined) updates.purpose = purpose;
+        if (testInstructions !== undefined) updates.testInstructions = testInstructions;
+        if (tested !== undefined) updates.tested = tested;
+        if (basePath !== undefined) updates.basePath = basePath;
+        const updated = await infraService.updateApplication(userId, projectId, name, updates);
+        res.json({ message: `Application "${name}" updated`, application: updated });
+      } else {
+        // Create
+        const newApp = await infraService.addApplication(userId, projectId, {
+          name, port: port || 3000, type: type || 'fullstack',
+          dockerService, description, purpose, testInstructions, basePath,
+        });
+        res.status(201).json({ message: `Application "${name}" created`, application: newApp });
+      }
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+
+  /** POST /employees/:id/self/applications/:appName/screenshots — upload screenshot from file path */
+  async selfUploadScreenshot(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const emp = await Employee.findById(req.params.id).select('projectId userId').lean();
+      if (!emp) { res.status(404).json({ error: 'Employee not found' }); return; }
+      const { appName } = req.params;
+      const { filePath, caption } = req.body;
+      if (!filePath) { res.status(400).json({ error: 'filePath is required' }); return; }
+
+      const project = await Project.findById(emp.projectId);
+      if (!project) { res.status(404).json({ error: 'Project not found' }); return; }
+
+      const app = project.applications.find(a => a.name === appName);
+      if (!app) { res.status(404).json({ error: `Application "${appName}" not found` }); return; }
+
+      // Resolve and validate the source file
+      const srcPath = path.resolve(filePath.replace(/\\/g, '/'));
+      if (!fs.existsSync(srcPath)) { res.status(400).json({ error: `File not found: ${filePath}` }); return; }
+
+      const SCREENSHOTS_DIR = path.resolve(__dirname, '../../../ManagerMemory/screenshots');
+      const destDir = path.join(SCREENSHOTS_DIR, emp.projectId.toString(), appName);
+      if (!fs.existsSync(destDir)) fs.mkdirSync(destDir, { recursive: true });
+
+      const origName = path.basename(srcPath);
+      const destName = `${Date.now()}-${origName}`;
+      fs.copyFileSync(srcPath, path.join(destDir, destName));
+
+      app.screenshots.push({
+        filename: destName,
+        originalName: origName,
+        caption: caption || origName.replace(/\.\w+$/, '').replace(/[-_]/g, ' '),
+        takenBy: 'developer',
+        takenAt: new Date(),
+      });
+      await project.save();
+
+      res.status(201).json({ message: 'Screenshot uploaded', screenshot: app.screenshots[app.screenshots.length - 1] });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+
+  /** POST /employees/:id/self/inbox — send a message to Alfred's inbox (no auth) */
+  async selfSendInbox(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const emp = await Employee.findById(req.params.id).select('userId projectId name avatar role').lean();
+      if (!emp) { res.status(404).json({ error: 'Employee not found' }); return; }
+      const { type, subject, body } = req.body;
+      if (!subject) { res.status(400).json({ error: 'subject is required' }); return; }
+
+      const project = await Project.findById(emp.projectId).select('name').lean();
+
+      const msg = await ManagerInbox.create({
+        userId: emp.userId,
+        employeeId: emp._id,
+        projectId: emp.projectId,
+        employeeName: emp.name,
+        employeeAvatar: emp.avatar || '',
+        employeeRole: emp.role,
+        projectName: project?.name || '',
+        type: type || 'info',
+        subject,
+        body: body || '',
+        read: false,
+      });
+
+      // Wake Alfred so he processes this message quickly
+      managerService.onEmployeeEvent(emp.name, 'inbox_message');
+
+      res.status(201).json({ message: 'Message sent to Alfred', inboxId: msg._id.toString() });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }

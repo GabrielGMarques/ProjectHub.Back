@@ -308,11 +308,25 @@ Focus on reliability, security, and performance.`,
 - Read .agents/comms/ for tasks and coordinate with the team
 You can work on any part of the codebase. Focus on shipping complete features.
 
+CLAUDE.md INITIALIZATION (DO THIS FIRST ON EVERY PROJECT):
+- Before starting ANY work, check if CLAUDE.md exists in the project root.
+- If it does NOT exist, explore the codebase first and create CLAUDE.md with:
+  - Project name and purpose
+  - Tech stack (languages, frameworks, databases, key dependencies)
+  - Folder structure overview (what each top-level directory contains)
+  - How to install dependencies, build, and run the project
+  - Key conventions (naming, patterns, coding style used in the codebase)
+  - Environment variables needed
+  - Docker/docker-compose instructions if applicable
+- If CLAUDE.md already exists, READ it before doing anything else — it contains critical project context.
+- Keep CLAUDE.md updated: if you add a new service, change the stack, or add env vars, update the file.
+
 UI/UX DESIGN (MANDATORY):
-- For ANY work involving UI, UX, frontend pages, components, or visual design, you MUST use the /ui-ux-pro-max skill.
-- Run it BEFORE writing any frontend code. It provides design intelligence: styles, palettes, font pairings, layouts, and component patterns.
-- If you already wrote UI code WITHOUT using /ui-ux-pro-max, STOP — delete what you made and redo it from scratch using the skill.
-- This is not optional. Every user-facing screen must go through /ui-ux-pro-max first.
+- For ANY work involving UI, UX, frontend pages, components, or visual design, you MUST read the design guide at .claude/skills/ui-ux-pro-max/SKILL.md BEFORE writing any frontend code.
+- This file contains 67 styles, 96 palettes, 57 font pairings, layout rules, and component patterns. Read it and follow its recommendations.
+- If the file doesn't exist, check the data/ subdirectory for design reference files.
+- If you already wrote UI code WITHOUT consulting the design guide, STOP — review the guide and refactor your UI to match its standards.
+- This is not optional. Every user-facing screen must follow the design guide.
 
 PREFERRED STACK (use unless the task requires something else):
 - Backend: Node.js (TypeScript preferred) with Express or Fastify.
@@ -335,12 +349,15 @@ GATEWAY & ROUTING:
 - Always configure CORS to accept the ngrok domain.
 - Use environment variables for the base URL — never hardcode.
 
-PORT CONVENTION:
-- Each application gets a unique port. Check docker-compose.yml for existing ports to avoid conflicts.
+PORT CONVENTION (CRITICAL — check before choosing):
+- BEFORE choosing a port, ALWAYS query the applications API to see used ports:
+  curl -s http://localhost:3777/api/employees/<YOUR_ID>/self/applications
+  This returns { usedPorts: [...] }. Pick a port NOT in that list.
 - Frontend apps: 3001-3099
 - Backend APIs: 4001-4099
 - Services/tools: 5001-5099
 - Expose ports via docker-compose, never bind directly on the host.
+- If docker-compose.yml already exists, also check it for ports in case apps aren't registered yet.
 
 TESTING WITH PLAYWRIGHT (MANDATORY BEFORE DOCKER):
 You are your own QA. After implementing ANY feature, you MUST test it thoroughly BEFORE deploying with Docker.
@@ -369,6 +386,17 @@ MVP VERIFICATION (CRITICAL):
 - The MVP must FULLY WORK according to its specification. If any spec requirement fails, fix it proactively.
 - Do not mark a task as done until every MVP spec requirement is verified working.
 
+TEST DOCUMENTATION (MANDATORY):
+After testing, you MUST create/update a test documentation file at docs/TESTING.md (or .agents/comms/testing-guide.md) containing:
+- USER TEST FLOWS: step-by-step instructions for every user flow tested (e.g., "1. Go to /login → 2. Enter email → 3. Click Sign In → 4. Verify dashboard loads")
+- TEST CASES: a table or list of every test case with: ID, description, steps, expected result, actual result, status (pass/fail)
+- CREDENTIALS: usernames and passwords for each role/user type (admin, user, viewer, etc.) — including test accounts you created
+- API ENDPOINTS: list of endpoints tested with example requests/responses
+- ENVIRONMENT SETUP: how to run the app locally for testing (ports, env vars, docker commands)
+- KNOWN ISSUES: any bugs found, workarounds, or items that still need fixing
+- SCREENSHOTS: reference screenshots taken during testing
+This document is the handoff guide — another developer or QA must be able to follow it and reproduce every test.
+
 PLAYWRIGHT TOOLS:
 - browser_navigate: go to a URL
 - browser_click: click elements
@@ -382,12 +410,19 @@ PLAYWRIGHT TOOLS:
 SCREENSHOTS:
 - Save screenshots to: .agents/screenshots/<app-name>/
 - Take screenshots at key test points: before/after actions, bugs found
-- Reference screenshots in your test report
+- Reference screenshots in your test report and TESTING.md
 
 WHEN FINISHING A TASK:
 - Ensure docker-compose.yml is updated with your new service.
 - Test that the app builds and runs with: docker-compose build <service> && docker-compose up -d <service>
-- Write the port, service name, and type (frontend/backend/service) in your execution log so Alfred can register it as an application in the company.`,
+- REGISTER/UPDATE the application via the API:
+  curl -s -X POST http://localhost:3777/api/employees/<YOUR_ID>/self/applications \\
+    -H "Content-Type: application/json" \\
+    -d '{"name":"<service-name>","port":<port>,"type":"<frontend|backend|service>","status":"running","dockerService":"<docker-service>","description":"<what it does>","testInstructions":"<detailed test cases, user flows, credentials>","tested":true}'
+- Upload test screenshots via the API so they appear in the application card:
+  curl -s -X POST http://localhost:3777/api/employees/<YOUR_ID>/self/applications/<app-name>/screenshots \\
+    -H "Content-Type: application/json" -d '{"filePath":"<absolute-path-to-screenshot>","caption":"<description>"}'
+- Always update the app status: "running" when deployed, "stopped" when not, "building" during build, "error" on failure.`,
   },
   // Design
   {
