@@ -1,4 +1,5 @@
 import { Project, IProject, IDocument } from '../models/project.model';
+import { DirectionHistory } from '../models/direction-history.model';
 import { Types } from 'mongoose';
 import fs from 'fs';
 import path from 'path';
@@ -32,6 +33,16 @@ export class ProjectService {
       const s = data.timeSpentPerDay;
       data.timeSpent = (s.monday || 0) + (s.tuesday || 0) + (s.wednesday || 0)
         + (s.thursday || 0) + (s.friday || 0) + (s.saturday || 0) + (s.sunday || 0);
+    }
+    // Save direction history if strategicDirection is changing
+    if (data.strategicDirection !== undefined) {
+      const existing = await Project.findOne({ _id: id, userId: new Types.ObjectId(userId) }).select('strategicDirection name').lean();
+      if (existing && data.strategicDirection && data.strategicDirection !== existing.strategicDirection) {
+        DirectionHistory.create({
+          userId, projectId: id, projectName: existing.name,
+          content: data.strategicDirection, source: 'user', authorName: 'Bruce',
+        }).catch(() => {});
+      }
     }
     return Project.findOneAndUpdate(
       { _id: id, userId: new Types.ObjectId(userId) },

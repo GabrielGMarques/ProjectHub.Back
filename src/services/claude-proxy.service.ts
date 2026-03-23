@@ -26,6 +26,17 @@ export interface ProxyMessage {
   content: string;
 }
 
+export interface ProxyUsageData {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  costUsd: number;
+  durationMs: number;
+  numTurns: number;
+  model: string;
+}
+
 export interface ProxyOptions {
   system?: string;
   messages: ProxyMessage[];
@@ -76,8 +87,17 @@ export async function claudeChat(opts: ProxyOptions & { timeoutMs?: number; retr
   throw lastError || new Error('Claude chat failed after retries');
 }
 
+// Internal tracking: last usage from most recent doQuery call
+let _lastUsage: ProxyUsageData | null = null;
+
+/** Get the usage data from the most recent claudeChat call */
+export function getLastUsage(): ProxyUsageData | null {
+  return _lastUsage;
+}
+
 async function doQuery(opts: ProxyOptions): Promise<string> {
   const queryFn = await getQuery();
+  _lastUsage = null;
 
   // Build a single prompt from system + messages
   const parts: string[] = [];
@@ -110,8 +130,23 @@ async function doQuery(opts: ProxyOptions): Promise<string> {
 
   let result = '';
   for await (const message of conversation) {
-    if (message.type === 'result' && message.result) {
-      result = message.result;
+    if (message.type === 'result') {
+      if (message.result) result = message.result;
+      // Capture usage
+      if (message.usage) {
+        const u = message.usage;
+        const modelKeys = Object.keys(message.modelUsage || {});
+        _lastUsage = {
+          inputTokens: u.input_tokens || 0,
+          outputTokens: u.output_tokens || 0,
+          cacheReadTokens: u.cache_read_input_tokens || 0,
+          cacheCreationTokens: u.cache_creation_input_tokens || 0,
+          costUsd: message.total_cost_usd || 0,
+          durationMs: message.duration_ms || 0,
+          numTurns: message.num_turns || 0,
+          model: modelKeys[0] || 'claude-agent-sdk',
+        };
+      }
     } else if (message.type === 'assistant' && message.message?.content) {
       for (const block of message.message.content) {
         if (block.type === 'text' && block.text) {

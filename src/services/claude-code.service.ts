@@ -11,11 +11,23 @@ export interface ClaudeCodeEvent {
   timestamp: Date;
 }
 
+export interface TokenUsageData {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  costUsd: number;
+  durationMs: number;
+  numTurns: number;
+  model: string;
+}
+
 export interface RunCommandResult {
   sessionId: string;
   sdkSessionId?: string;
   events: ClaudeCodeEvent[];
   status: 'completed' | 'failed' | 'cancelled';
+  tokenUsage?: TokenUsageData;
 }
 
 const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
@@ -35,8 +47,9 @@ async function getQuery() {
 export class ClaudeCodeService {
   isAvailable: boolean = false;
 
-  private activeSessions: Map<string, { close: () => void; sdkSessionId?: string; projectId?: string; startedAt: Date }> = new Map();
-  private pendingMessages: Map<string, string[]> = new Map();
+  // Static so all instances share the same session tracking
+  private static activeSessions: Map<string, { close: () => void; sdkSessionId?: string; projectId?: string; startedAt: Date }> = new Map();
+  private static pendingMessages: Map<string, string[]> = new Map();
   private cleanupInterval: ReturnType<typeof setInterval> | null = null;
 
   async checkAvailability(): Promise<{ available: boolean; version: string }> {
@@ -56,7 +69,7 @@ export class ClaudeCodeService {
     projectPath: string,
     prompt: string,
     onEvent: (event: ClaudeCodeEvent) => void,
-    options?: { resumeSdkSessionId?: string; allowedTools?: string[]; keepAlive?: boolean },
+    options?: { resumeSdkSessionId?: string; allowedTools?: string[]; keepAlive?: boolean; mcpServers?: Record<string, any> },
     timeoutMs: number = DEFAULT_TIMEOUT_MS
   ): Promise<RunCommandResult> {
     // Validate project path — normalize to forward slashes for the SDK
@@ -76,9 +89,13 @@ export class ClaudeCodeService {
     const collectedEvents: ClaudeCodeEvent[] = [];
     let sdkSessionId: string | undefined;
     let status: 'completed' | 'failed' | 'cancelled' = 'completed';
+    let accumulatedUsage: TokenUsageData = {
+      inputTokens: 0, outputTokens: 0, cacheReadTokens: 0,
+      cacheCreationTokens: 0, costUsd: 0, durationMs: 0, numTurns: 0, model: 'claude-agent-sdk',
+    };
 
     // Initialize pending messages queue for this session
-    this.pendingMessages.set(sessionId, []);
+    ClaudeCodeService.pendingMessages.set(sessionId, []);
 
     // Timeout guard
     const timer = setTimeout(() => {
@@ -108,6 +125,11 @@ export class ClaudeCodeService {
       env: sdkEnv,
     };
 
+    // Pass MCP servers directly to the SDK (required for MCP tools to be available)
+    if (options?.mcpServers && Object.keys(options.mcpServers).length > 0) {
+      baseOptions.mcpServers = options.mcpServers;
+    }
+
     let currentPrompt = prompt;
     let resumeId = options?.resumeSdkSessionId;
 
@@ -125,7 +147,7 @@ export class ClaudeCodeService {
         });
 
         // Store reference so we can close it on cancel/inject
-        this.activeSessions.set(sessionId, {
+        ClaudeCodeService.activeSessions.set(sessionId, {
           close: () => conversation.close(),
           sdkSessionId,
           projectId: undefined,
@@ -140,8 +162,21 @@ export class ClaudeCodeService {
             if (!sdkSessionId && message.session_id) {
               sdkSessionId = message.session_id;
               // Update stored reference with sdkSessionId
-              const session = this.activeSessions.get(sessionId);
+              const session = ClaudeCodeService.activeSessions.get(sessionId);
               if (session) session.sdkSessionId = sdkSessionId;
+            }
+            // Capture token usage from result messages
+            if (message.type === 'result' && message.usage) {
+              const u = message.usage;
+              accumulatedUsage.inputTokens += u.input_tokens || 0;
+              accumulatedUsage.outputTokens += u.output_tokens || 0;
+              accumulatedUsage.cacheReadTokens += u.cache_read_input_tokens || 0;
+              accumulatedUsage.cacheCreationTokens += u.cache_creation_input_tokens || 0;
+              accumulatedUsage.costUsd += message.total_cost_usd || 0;
+              accumulatedUsage.durationMs += message.duration_ms || 0;
+              accumulatedUsage.numTurns += message.num_turns || 0;
+              const modelKeys = Object.keys(message.modelUsage || {});
+              if (modelKeys.length > 0) accumulatedUsage.model = modelKeys[0];
             }
             this.processMessage(message, sessionId, (event) => {
               collectedEvents.push(event);
@@ -150,7 +185,7 @@ export class ClaudeCodeService {
           }
         } catch (err: any) {
           // Check if this was closed for message injection
-          const pending = this.pendingMessages.get(sessionId);
+          const pending = ClaudeCodeService.pendingMessages.get(sessionId);
           if (pending && pending.length > 0 && (err.name === 'AbortError' || err.message === 'Query closed')) {
             closedForInjection = true;
           } else if (err.name === 'AbortError' || err.message === 'Query closed') {
@@ -171,7 +206,7 @@ export class ClaudeCodeService {
         }
 
         // Check for pending injected messages
-        const pending = this.pendingMessages.get(sessionId);
+        const pending = ClaudeCodeService.pendingMessages.get(sessionId);
         if (closedForInjection && pending && pending.length > 0 && sdkSessionId) {
           currentPrompt = pending.shift()!;
           resumeId = sdkSessionId;
@@ -202,13 +237,13 @@ export class ClaudeCodeService {
           // Wait for a new message to be injected
           await new Promise<void>((resolve) => {
             const checkInterval = setInterval(() => {
-              const pending = this.pendingMessages.get(sessionId);
+              const pending = ClaudeCodeService.pendingMessages.get(sessionId);
               if (pending && pending.length > 0) {
                 clearInterval(checkInterval);
                 resolve();
               }
               // If session was cancelled, stop waiting
-              if (!this.activeSessions.has(sessionId)) {
+              if (!ClaudeCodeService.activeSessions.has(sessionId)) {
                 clearInterval(checkInterval);
                 resolve();
               }
@@ -216,9 +251,9 @@ export class ClaudeCodeService {
           });
 
           // Check if we were cancelled
-          if (!this.activeSessions.has(sessionId)) break;
+          if (!ClaudeCodeService.activeSessions.has(sessionId)) break;
 
-          const pending = this.pendingMessages.get(sessionId);
+          const pending = ClaudeCodeService.pendingMessages.get(sessionId);
           if (pending && pending.length > 0) {
             currentPrompt = pending.shift()!;
             resumeId = sdkSessionId;
@@ -231,14 +266,18 @@ export class ClaudeCodeService {
       }
     } finally {
       clearTimeout(timer);
-      this.activeSessions.delete(sessionId);
-      this.pendingMessages.delete(sessionId);
+      ClaudeCodeService.activeSessions.delete(sessionId);
+      ClaudeCodeService.pendingMessages.delete(sessionId);
       const doneEvent: ClaudeCodeEvent = { type: 'done', sessionId, timestamp: new Date() };
       collectedEvents.push(doneEvent);
       onEvent(doneEvent);
     }
 
-    return { sessionId, sdkSessionId, events: collectedEvents, status };
+    const hasUsage = accumulatedUsage.inputTokens > 0 || accumulatedUsage.outputTokens > 0 || accumulatedUsage.costUsd > 0;
+    return {
+      sessionId, sdkSessionId, events: collectedEvents, status,
+      tokenUsage: hasUsage ? accumulatedUsage : undefined,
+    };
   }
 
   /**
@@ -247,10 +286,10 @@ export class ClaudeCodeService {
    * will resume the SDK session with this message as the new prompt.
    */
   injectMessage(sessionId: string, message: string): boolean {
-    const session = this.activeSessions.get(sessionId);
+    const session = ClaudeCodeService.activeSessions.get(sessionId);
     if (!session) return false;
 
-    const pending = this.pendingMessages.get(sessionId);
+    const pending = ClaudeCodeService.pendingMessages.get(sessionId);
     if (!pending) return false;
 
     // Queue the message and close the conversation to trigger resume
@@ -263,23 +302,62 @@ export class ClaudeCodeService {
    * Find a session by employee taskId (which is used as the sessionId in activeSessions)
    */
   findSessionByTaskId(taskId: string): string | null {
-    if (this.activeSessions.has(taskId)) return taskId;
+    if (ClaudeCodeService.activeSessions.has(taskId)) return taskId;
     return null;
   }
 
+  /** Check if a session is currently alive and running */
+  isSessionAlive(sessionId: string): boolean {
+    return ClaudeCodeService.activeSessions.has(sessionId);
+  }
+
   cancelSession(sessionId: string): boolean {
-    const session = this.activeSessions.get(sessionId);
+    const session = ClaudeCodeService.activeSessions.get(sessionId);
     if (!session) return false;
     // Clear pending messages so the loop doesn't resume
-    this.pendingMessages.delete(sessionId);
+    ClaudeCodeService.pendingMessages.delete(sessionId);
     session.close();
-    this.activeSessions.delete(sessionId);
+    ClaudeCodeService.activeSessions.delete(sessionId);
     return true;
+  }
+
+  /**
+   * Run a short-lived, focused Claude Code session.
+   * Returns the final text result (no streaming), with a tight timeout.
+   * Designed for Alfred's hands-on investigations/fixes — no keepAlive, no resume.
+   */
+  async runQuick(
+    projectPath: string,
+    prompt: string,
+    options?: { allowedTools?: string[]; timeoutMs?: number }
+  ): Promise<{ result: string; status: 'completed' | 'failed' | 'cancelled'; events: ClaudeCodeEvent[] }> {
+    const timeout = options?.timeoutMs || 3 * 60 * 1000; // 3 min default
+    const tools = options?.allowedTools || ['Read', 'Glob', 'Grep', 'Bash'];
+    const allEvents: ClaudeCodeEvent[] = [];
+
+    const { status } = await this.runCommand(
+      projectPath,
+      prompt,
+      (event) => allEvents.push(event),
+      { allowedTools: tools, keepAlive: false },
+      timeout,
+    );
+
+    // Extract text from events — last text block is typically the final summary
+    const textParts = allEvents
+      .filter(e => e.type === 'text' && e.content)
+      .map(e => e.content!);
+
+    const result = textParts.length > 0
+      ? textParts[textParts.length - 1]
+      : (status === 'failed' ? 'Session failed with no output' : 'No result produced');
+
+    return { result, status, events: allEvents };
   }
 
   /** Get all currently running sessions */
   getActiveSessions(): { sessionId: string; projectId?: string; startedAt: Date }[] {
-    return Array.from(this.activeSessions.entries()).map(([sessionId, s]) => ({
+    return Array.from(ClaudeCodeService.activeSessions.entries()).map(([sessionId, s]) => ({
       sessionId,
       projectId: s.projectId,
       startedAt: s.startedAt,
@@ -289,9 +367,9 @@ export class ClaudeCodeService {
   /** Stop all running sessions */
   stopAllSessions(): number {
     let count = 0;
-    for (const [sessionId, session] of this.activeSessions) {
+    for (const [sessionId, session] of ClaudeCodeService.activeSessions) {
       try { session.close(); } catch {}
-      this.activeSessions.delete(sessionId);
+      ClaudeCodeService.activeSessions.delete(sessionId);
       count++;
     }
     return count;
@@ -316,12 +394,12 @@ export class ClaudeCodeService {
     if (this.cleanupInterval) return;
     this.cleanupInterval = setInterval(() => {
       const now = Date.now();
-      for (const [sessionId, session] of this.activeSessions) {
+      for (const [sessionId, session] of ClaudeCodeService.activeSessions) {
         const elapsed = now - session.startedAt.getTime();
         if (elapsed > DEFAULT_TIMEOUT_MS) {
           console.log(`[ClaudeCode] Stopping timed-out session: ${sessionId}`);
           try { session.close(); } catch {}
-          this.activeSessions.delete(sessionId);
+          ClaudeCodeService.activeSessions.delete(sessionId);
         }
       }
     }, intervalMs);

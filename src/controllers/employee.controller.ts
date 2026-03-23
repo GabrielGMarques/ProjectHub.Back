@@ -7,6 +7,11 @@ import { TelemetryService } from '../services/telemetry.service';
 import { ProjectService } from '../services/project.service';
 import { employeeMemoryService } from '../services/employee-memory.service';
 import { wsService } from '../services/websocket.service';
+import { telegramBot } from '../services/telegram.service';
+import { WorkingStatusHistory } from '../models/working-status-history.model';
+import { DirectionHistory } from '../models/direction-history.model';
+import { Project } from '../models/project.model';
+import { managerService } from '../services/manager.service';
 
 const employeeService = new EmployeeService();
 const projectService = new ProjectService();
@@ -181,6 +186,124 @@ export class EmployeeController {
     }
   }
 
+  async getStatusHistory(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const { id } = req.params;
+      const page = parseInt(req.query.page as string) || 1;
+      const limit = Math.min(parseInt(req.query.limit as string) || 50, 200);
+      const skip = (page - 1) * limit;
+
+      const [entries, total] = await Promise.all([
+        WorkingStatusHistory.find({ employeeId: id }).sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+        WorkingStatusHistory.countDocuments({ employeeId: id }),
+      ]);
+
+      res.json({ entries, total, page, limit, pages: Math.ceil(total / limit) });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+
+  /** Self-service status history — no auth, called by employee agents */
+  async getSelfStatusHistory(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const { id } = req.params;
+      const limit = Math.min(parseInt(req.query.limit as string) || 10, 50);
+      const entries = await WorkingStatusHistory.find({ employeeId: id })
+        .sort({ createdAt: -1 }).limit(limit).lean();
+      res.json({ entries });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+
+  /** Self-service: list all employees in the same company (no auth) */
+  async getSelfTeam(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const emp = await Employee.findById(req.params.id).select('projectId').lean();
+      if (!emp) { res.status(404).json({ error: 'Employee not found' }); return; }
+      const team = await Employee.find({ projectId: emp.projectId })
+        .select('name title role avatar status workingStatus workingStatusAt lastActivity currentTask')
+        .sort({ hiredAt: 1 }).lean();
+      res.json(team);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+
+  /** Self-service: get working status of a specific teammate (no auth) */
+  async getSelfTeammateStatus(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const teammate = await Employee.findById(req.params.teammateId)
+        .select('name title role avatar status workingStatus workingStatusAt taskHistory').lean();
+      if (!teammate) { res.status(404).json({ error: 'Employee not found' }); return; }
+      const statusHistory = await WorkingStatusHistory.find({ employeeId: req.params.teammateId })
+        .sort({ createdAt: -1 }).limit(10).lean();
+      res.json({
+        name: teammate.name,
+        title: teammate.title,
+        role: teammate.role,
+        status: teammate.status,
+        workingStatus: teammate.workingStatus,
+        workingStatusAt: teammate.workingStatusAt,
+        taskHistory: (teammate.taskHistory || []).slice(-10).map((t: any) => ({
+          taskId: t.taskId, description: t.description, status: t.status,
+          result: t.result?.substring(0, 500), startedAt: t.startedAt, completedAt: t.completedAt,
+        })),
+        statusHistory: statusHistory.map((e: any) => ({
+          content: e.content, source: e.source, createdAt: e.createdAt,
+        })),
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+
+  /** Self-service: get company direction + direction history (no auth) */
+  async getSelfDirection(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const emp = await Employee.findById(req.params.id).select('projectId').lean();
+      if (!emp) { res.status(404).json({ error: 'Employee not found' }); return; }
+      const project = await Project.findById(emp.projectId).select('name strategicDirection strategicCycle').lean();
+      if (!project) { res.status(404).json({ error: 'Project not found' }); return; }
+      const history = await DirectionHistory.find({ projectId: emp.projectId })
+        .sort({ createdAt: -1 }).limit(20).lean();
+      res.json({
+        projectName: project.name,
+        currentDirection: project.strategicDirection || '',
+        cycle: project.strategicCycle,
+        history: history.map((h: any) => ({
+          content: h.content, source: h.source,
+          authorName: h.authorName, authorRole: h.authorRole, createdAt: h.createdAt,
+        })),
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+
+  /** Self-service: CEO sets the company direction (no auth) */
+  async setSelfDirection(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const { direction } = req.body;
+      if (!direction) { res.status(400).json({ error: 'direction is required' }); return; }
+      const emp = await Employee.findById(req.params.id);
+      if (!emp) { res.status(404).json({ error: 'Employee not found' }); return; }
+      const project = await Project.findByIdAndUpdate(
+        emp.projectId, { strategicDirection: direction }, { new: true }
+      );
+      if (!project) { res.status(404).json({ error: 'Project not found' }); return; }
+      DirectionHistory.create({
+        userId: emp.userId.toString(), projectId: emp.projectId.toString(),
+        projectName: project.name, content: direction,
+        source: 'ceo', authorName: emp.name, authorRole: emp.role,
+      }).catch(() => {});
+      res.json({ message: `Direction updated for ${project.name}`, direction: project.strategicDirection });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+
   // ── Memory endpoints ──
 
   async getMemories(req: AuthRequest, res: Response): Promise<void> {
@@ -236,10 +359,36 @@ export class EmployeeController {
     }
   }
 
+  async getDebugConfig(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const config = await employeeService.getDebugConfig(req.userId!, req.params.id);
+      res.json(config);
+    } catch (err: any) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+
+  async clearSession(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const emp = await Employee.findById(req.params.id);
+      if (!emp) { res.status(404).json({ error: 'Employee not found' }); return; }
+      const oldSession = emp.activeSessionId || emp.sdkSessionId || '(none)';
+      emp.sdkSessionId = '';
+      emp.activeSessionId = '';
+      emp.currentTask = '';
+      emp.status = 'idle';
+      await emp.save();
+      wsService.employeeStatusChanged(emp._id.toString(), emp.projectId.toString(), 'idle', emp.name);
+      res.json({ message: `Session cleared for ${emp.name}. Old session: ${oldSession}` });
+    } catch (err: any) {
+      res.status(400).json({ error: err.message });
+    }
+  }
+
   async restartEmployee(req: AuthRequest, res: Response): Promise<void> {
     try {
-      // Kill session completely
-      const result = await employeeService.restartEmployee(req.userId!, req.params.id);
+      // Force=true from HR panel — always kills session and boots fresh
+      const result = await employeeService.restartEmployee(req.userId!, req.params.id, true);
       res.json(result);
     } catch (err: any) {
       res.status(400).json({ error: err.message });
@@ -260,6 +409,7 @@ export class EmployeeController {
       );
       if (!emp) { res.status(404).json({ error: 'Employee not found' }); return; }
       wsService.employeeStatusChanged(emp._id.toString(), emp.projectId.toString(), status, emp.name);
+      if (status === 'idle') managerService.onEmployeeEvent(emp.name, 'idle');
       res.json({ message: `Status set to ${status}`, status: emp.status });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -282,7 +432,10 @@ export class EmployeeController {
 
       task.status = 'completed';
       task.completedAt = new Date();
-      if (result) task.result = result.substring(0, 5000);
+      if (result) {
+        task.result = result.substring(0, 5000);
+        (task as any).resultUpdatedAt = new Date();
+      }
 
       // Check if all tasks are done — set to idle
       const hasInProgress = emp.taskHistory.some(t => t.status === 'in_progress');
@@ -312,6 +465,12 @@ export class EmployeeController {
         wsService.employeeStatusChanged(emp._id.toString(), emp.projectId.toString(), emp.status, emp.name);
       }
 
+      // Notify Telegram
+      telegramBot.send(`✅ *${emp.name}* finished: "${task.description}"\n📋 _${project?.name || 'Unknown'}_`).catch(() => {});
+
+      // Wake Alfred so he processes the completion immediately
+      managerService.onEmployeeEvent(emp.name, 'task_done');
+
       res.json({
         message: `Task marked done: ${task.description}`,
         status: emp.status,
@@ -337,6 +496,7 @@ export class EmployeeController {
       if (!task) { res.status(404).json({ error: 'Task not found' }); return; }
 
       task.result = result.substring(0, 5000);
+      (task as any).resultUpdatedAt = new Date();
       await emp.save();
 
       wsService.employeeTaskUpdate(emp._id.toString(), emp.projectId.toString(), {
@@ -361,6 +521,7 @@ export class EmployeeController {
 
       emp.workingStatus = status.substring(0, 2000);
       emp.workingStatusAt = new Date();
+      emp.workingStatusRead = false;
       emp.lastActivity = new Date();
 
       // Auto-detect idle intent from the status text
@@ -376,12 +537,34 @@ export class EmployeeController {
         }
         emp.status = 'idle';
         emp.currentTask = '';
+
+        // Notify on auto-completion
+        const uid2 = emp.userId.toString();
+        const proj2 = await projectService.findById(emp.projectId.toString(), uid2);
+        telegramBot.send(`✅ *${emp.name}* is done (${inProgressTasks.length} task${inProgressTasks.length > 1 ? 's' : ''} completed)\n📋 _${proj2?.name || 'Unknown'}_`).catch(() => {});
+        wsService.employeeStatusChanged(emp._id.toString(), emp.projectId.toString(), 'idle', emp.name);
+        for (const task of inProgressTasks) {
+          wsService.employeeTaskUpdate(emp._id.toString(), emp.projectId.toString(), {
+            taskId: task.taskId, status: task.status, result: task.result, description: task.description,
+          });
+        }
       }
 
       await emp.save();
 
       const uid = emp.userId.toString();
       const project = await projectService.findById(emp.projectId.toString(), uid);
+
+      // Save full working status to history
+      const latestTask = emp.taskHistory[emp.taskHistory.length - 1];
+      WorkingStatusHistory.create({
+        userId: uid, employeeId: emp._id.toString(), projectId: emp.projectId.toString(),
+        employeeName: emp.name, employeeRole: emp.role,
+        content: status.substring(0, 5000),
+        source: 'api',
+        taskId: latestTask?.taskId,
+      }).catch(() => {});
+
       EmployeeLog.create({
         userId: uid, employeeId: emp._id.toString(), projectId: emp.projectId.toString(),
         category: 'text', content: `📋 Working status: ${status.substring(0, 200)}`,
@@ -390,6 +573,9 @@ export class EmployeeController {
       }).catch(() => {});
 
       wsService.employeeStatusChanged(emp._id.toString(), emp.projectId.toString(), emp.status, emp.name);
+
+      // Wake Alfred — idle transitions are high-priority, regular updates are informational
+      managerService.onEmployeeEvent(emp.name, emp.status === 'idle' ? 'idle' : 'status_update');
 
       res.json({
         message: 'Working status updated',

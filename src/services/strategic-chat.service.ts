@@ -2,7 +2,8 @@ import OpenAI from 'openai';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { IProject } from '../models/project.model';
 import { AIModel } from './ai.service';
-import { claudeChat } from './claude-proxy.service';
+import { claudeChat, getLastUsage } from './claude-proxy.service';
+import { TokenUsageService } from './token-usage.service';
 
 interface ChatMessage {
   role: 'user' | 'assistant';
@@ -18,6 +19,7 @@ const MODEL_IDS: Record<AIModel, string> = {
 export class StrategicChatService {
   private openai: OpenAI | null = null;
   private gemini: GoogleGenerativeAI | null = null;
+  private tokenUsageService = new TokenUsageService();
 
   constructor() {
     if (process.env.OPENAI_API_KEY) {
@@ -32,24 +34,36 @@ export class StrategicChatService {
     return true; // Claude always available via subscription
   }
 
-  async chat(projects: IProject[], messages: ChatMessage[], model: AIModel = 'claude-sonnet'): Promise<string> {
+  async chat(projects: IProject[], messages: ChatMessage[], model: AIModel = 'claude-sonnet', userId?: string): Promise<string> {
     const systemPrompt = this.buildSystemPrompt(projects);
     switch (model) {
-      case 'claude-sonnet': return this.callClaude(systemPrompt, messages);
-      case 'gpt-4o': return this.callOpenAI(systemPrompt, messages);
-      case 'gemini-2.5-flash': return this.callGemini(systemPrompt, messages);
+      case 'claude-sonnet': return this.callClaude(systemPrompt, messages, userId);
+      case 'gpt-4o': return this.callOpenAI(systemPrompt, messages, userId);
+      case 'gemini-2.5-flash': return this.callGemini(systemPrompt, messages, userId);
       default: throw new Error(`Unknown model: ${model}`);
     }
   }
 
-  private async callClaude(systemPrompt: string, messages: ChatMessage[]): Promise<string> {
-    return claudeChat({
+  private async callClaude(systemPrompt: string, messages: ChatMessage[], userId?: string): Promise<string> {
+    const result = await claudeChat({
       system: systemPrompt,
       messages: messages.map(m => ({ role: m.role, content: m.content })),
     });
+
+    const usage = getLastUsage();
+    if (usage && userId) {
+      this.tokenUsageService.record({
+        userId, source: 'strategic-chat', aiModel: usage.model,
+        inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
+        cacheReadTokens: usage.cacheReadTokens, cacheCreationTokens: usage.cacheCreationTokens,
+        costUsd: usage.costUsd, durationMs: usage.durationMs, numTurns: usage.numTurns,
+      });
+    }
+
+    return result;
   }
 
-  private async callOpenAI(systemPrompt: string, messages: ChatMessage[]): Promise<string> {
+  private async callOpenAI(systemPrompt: string, messages: ChatMessage[], userId?: string): Promise<string> {
     if (!this.openai) throw new Error('GPT is not configured. Set OPENAI_API_KEY.');
     const response = await this.openai.chat.completions.create({
       model: MODEL_IDS['gpt-4o'],
@@ -59,10 +73,19 @@ export class StrategicChatService {
         ...messages.map(m => ({ role: m.role as 'user' | 'assistant', content: m.content })),
       ],
     });
+
+    if (response.usage && userId) {
+      this.tokenUsageService.record({
+        userId, source: 'strategic-chat', aiModel: response.model || 'gpt-4o',
+        inputTokens: response.usage.prompt_tokens || 0,
+        outputTokens: response.usage.completion_tokens || 0,
+      });
+    }
+
     return response.choices[0]?.message?.content || '';
   }
 
-  private async callGemini(systemPrompt: string, messages: ChatMessage[]): Promise<string> {
+  private async callGemini(systemPrompt: string, messages: ChatMessage[], userId?: string): Promise<string> {
     if (!this.gemini) throw new Error('Gemini is not configured. Set GEMINI_API_KEY.');
     const model = this.gemini.getGenerativeModel({
       model: MODEL_IDS['gemini-2.5-flash'],
@@ -75,6 +98,16 @@ export class StrategicChatService {
     const chat = model.startChat({ history });
     const lastMessage = messages[messages.length - 1];
     const result = await chat.sendMessage(lastMessage.content);
+
+    const meta = result.response.usageMetadata;
+    if (meta && userId) {
+      this.tokenUsageService.record({
+        userId, source: 'strategic-chat', aiModel: 'gemini-2.5-flash',
+        inputTokens: meta.promptTokenCount || 0,
+        outputTokens: meta.candidatesTokenCount || 0,
+      });
+    }
+
     return result.response.text();
   }
 

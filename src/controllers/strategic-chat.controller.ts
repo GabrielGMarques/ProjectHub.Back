@@ -33,7 +33,7 @@ export class StrategicChatController {
 
     try {
       const projects = await projectService.findAllByUser(req.userId!);
-      const response = await strategicChatService.chat(projects, messages, model || 'claude-sonnet');
+      const response = await strategicChatService.chat(projects, messages, model || 'claude-sonnet', req.userId);
       res.json({ response });
     } catch (error: any) {
       res.status(500).json({ error: error.message || 'Strategic chat failed' });

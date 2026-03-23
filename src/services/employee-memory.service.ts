@@ -4,7 +4,7 @@ import { EmployeeLog } from '../models/employee-log.model';
 import { Employee } from '../models/employee.model';
 import { Types } from 'mongoose';
 
-const MAX_MEMORIES_PER_EMPLOYEE = 50;
+const MAX_MEMORIES_PER_EMPLOYEE = 20;
 const COMPACTION_BATCH_SIZE = 100;
 
 export class EmployeeMemoryService {

@@ -463,7 +463,7 @@ export class ProjectController {
         res.status(400).json({ error: 'messages array is required' });
         return;
       }
-      const response = await aiService.coach(project, messages, model as AIModel);
+      const response = await aiService.coach(project, messages, model as AIModel, req.userId);
       res.json({ response });
     } catch (error: any) {
       res.status(500).json({ error: error.message || 'AI coaching failed' });

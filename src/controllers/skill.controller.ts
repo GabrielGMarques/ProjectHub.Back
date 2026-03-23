@@ -71,7 +71,8 @@ export class SkillController {
         const response = await aiService.coach(
           project,
           [{ role: 'user', content: skill.prompt }],
-          model
+          model,
+          req.userId
         );
         res.json({ response, mode: 'ai-chat' });
       } catch (error: any) {

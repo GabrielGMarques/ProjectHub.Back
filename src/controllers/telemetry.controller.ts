@@ -1,10 +1,12 @@
 import { Response } from 'express';
 import { AuthRequest } from '../middleware/auth.middleware';
 import { TelemetryService } from '../services/telemetry.service';
+import { TokenUsageService } from '../services/token-usage.service';
 import { ManagerLog } from '../models/manager-log.model';
 import { EmployeeLog } from '../models/employee-log.model';
 
 const telemetryService = new TelemetryService();
+const tokenUsageService = new TokenUsageService();
 
 export class TelemetryController {
 
@@ -104,5 +106,17 @@ export class TelemetryController {
     };
 
     res.json({ logs, employees, stats });
+  }
+
+  async getTokenUsage(req: AuthRequest, res: Response): Promise<void> {
+    const days = parseInt(req.query.days as string) || 7;
+    const stats = await tokenUsageService.getStats(req.userId!, days);
+    res.json(stats);
+  }
+
+  async getRecentTokenUsage(req: AuthRequest, res: Response): Promise<void> {
+    const limit = parseInt(req.query.limit as string) || 50;
+    const records = await tokenUsageService.getRecent(req.userId!, limit);
+    res.json(records);
   }
 }

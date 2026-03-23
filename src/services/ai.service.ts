@@ -3,7 +3,8 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import fs from 'fs';
 import path from 'path';
 import { IProject } from '../models/project.model';
-import { claudeChat, isClaudeAvailable } from './claude-proxy.service';
+import { claudeChat, isClaudeAvailable, getLastUsage } from './claude-proxy.service';
+import { TokenUsageService } from './token-usage.service';
 
 let pdfParse: any;
 try {
@@ -34,6 +35,7 @@ export class AIService {
   private claudeAvailable: boolean | null = null;
   private openai: OpenAI | null = null;
   private gemini: GoogleGenerativeAI | null = null;
+  private tokenUsageService = new TokenUsageService();
 
   constructor() {
     if (process.env.OPENAI_API_KEY) {
@@ -66,34 +68,47 @@ export class AIService {
     ];
   }
 
-  async coach(project: IProject, messages: ChatMessage[], model: AIModel = 'claude-sonnet'): Promise<string> {
+  async coach(project: IProject, messages: ChatMessage[], model: AIModel = 'claude-sonnet', userId?: string): Promise<string> {
     const docTexts = await this.extractDocumentTexts(project);
     const systemPrompt = this.buildSystemPrompt(project, docTexts);
 
     switch (model) {
       case 'claude-sonnet':
-        return this.callClaude(systemPrompt, messages);
+        return this.callClaude(systemPrompt, messages, userId);
       case 'gpt-4o':
-        return this.callOpenAI(systemPrompt, messages);
+        return this.callOpenAI(systemPrompt, messages, userId);
       case 'gemini-2.5-flash':
-        return this.callGemini(systemPrompt, messages);
+        return this.callGemini(systemPrompt, messages, userId);
       default:
         throw new Error(`Unknown model: ${model}`);
     }
   }
 
-  private async callClaude(systemPrompt: string, messages: ChatMessage[]): Promise<string> {
+  private async callClaude(systemPrompt: string, messages: ChatMessage[], userId?: string): Promise<string> {
     const available = await this.checkClaude();
     if (!available) {
       throw new Error('Claude is not available. Ensure Claude Code CLI is installed and authenticated.');
     }
-    return claudeChat({
+    const result = await claudeChat({
       system: systemPrompt,
       messages: messages.map(m => ({ role: m.role, content: m.content })),
     });
+
+    // Record token usage
+    const usage = getLastUsage();
+    if (usage && userId) {
+      this.tokenUsageService.record({
+        userId, source: 'coach', aiModel: usage.model,
+        inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
+        cacheReadTokens: usage.cacheReadTokens, cacheCreationTokens: usage.cacheCreationTokens,
+        costUsd: usage.costUsd, durationMs: usage.durationMs, numTurns: usage.numTurns,
+      });
+    }
+
+    return result;
   }
 
-  private async callOpenAI(systemPrompt: string, messages: ChatMessage[]): Promise<string> {
+  private async callOpenAI(systemPrompt: string, messages: ChatMessage[], userId?: string): Promise<string> {
     if (!this.openai) {
       throw new Error('GPT is not configured. Set OPENAI_API_KEY in your environment.');
     }
@@ -105,10 +120,20 @@ export class AIService {
         ...messages.map(m => ({ role: m.role as 'user' | 'assistant', content: m.content })),
       ],
     });
+
+    // Record token usage
+    if (response.usage && userId) {
+      this.tokenUsageService.record({
+        userId, source: 'coach', aiModel: response.model || 'gpt-4o',
+        inputTokens: response.usage.prompt_tokens || 0,
+        outputTokens: response.usage.completion_tokens || 0,
+      });
+    }
+
     return response.choices[0]?.message?.content || '';
   }
 
-  private async callGemini(systemPrompt: string, messages: ChatMessage[]): Promise<string> {
+  private async callGemini(systemPrompt: string, messages: ChatMessage[], userId?: string): Promise<string> {
     if (!this.gemini) {
       throw new Error('Gemini is not configured. Set GEMINI_API_KEY in your environment.');
     }
@@ -125,6 +150,17 @@ export class AIService {
     const chat = model.startChat({ history });
     const lastMessage = messages[messages.length - 1];
     const result = await chat.sendMessage(lastMessage.content);
+
+    // Record token usage
+    const meta = result.response.usageMetadata;
+    if (meta && userId) {
+      this.tokenUsageService.record({
+        userId, source: 'coach', aiModel: 'gemini-2.5-flash',
+        inputTokens: meta.promptTokenCount || 0,
+        outputTokens: meta.candidatesTokenCount || 0,
+      });
+    }
+
     return result.response.text();
   }
 

@@ -11,10 +11,14 @@ import { telegramBot } from './telegram.service';
 import { EmployeeService } from './employee.service';
 import { ProjectService } from './project.service';
 import { ClaudeCodeService } from './claude-code.service';
-import { claudeChat } from './claude-proxy.service';
+import { claudeChat, getLastUsage } from './claude-proxy.service';
+import { TokenUsageService } from './token-usage.service';
 import { memoryService } from './memory.service';
 import { employeeMemoryService } from './employee-memory.service';
+import { wsService } from './websocket.service';
 import { infrastructureService } from './infrastructure.service';
+import { WorkingStatusHistory } from '../models/working-status-history.model';
+import { DirectionHistory } from '../models/direction-history.model';
 
 const telegramService = telegramBot;
 const employeeService = new EmployeeService();
@@ -56,12 +60,15 @@ export interface ManagerLogEntry {
 
 const managerLog: ManagerLogEntry[] = [];
 const MAX_LOG = 200;
-const MAX_HISTORY = 50;
+const MAX_HISTORY = 20;
 
-// In-memory log (fast, for /manager/log endpoint)
+// In-memory log (fast, for /manager/log endpoint) + WebSocket broadcast
 function log(type: ManagerLogEntry['type'], message: string): void {
-  managerLog.push({ timestamp: new Date(), type, message });
+  const entry = { timestamp: new Date(), type, message };
+  managerLog.push(entry);
   if (managerLog.length > MAX_LOG) managerLog.shift();
+  // Broadcast to frontend in real-time
+  try { wsService.managerLog({ type, message }); } catch {}
 }
 
 // Persistent 24h log (MongoDB, auto-expires via TTL index)
@@ -86,8 +93,13 @@ export class ManagerService {
   private employeeCheckInterval: ReturnType<typeof setInterval> | null = null;
   private activityCheckInterval: ReturnType<typeof setInterval> | null = null;
   private running = false;
+  private commMode: 'chat' | 'verbose' = 'chat';    // chat = only Alfred's analysis, verbose = include employee data
   private loopIntervalMs = 3 * 60 * 60 * 1000;     // main scan loop (default 3h)
   private readonly ACTIVITY_CHECK_MS = 5 * 60 * 1000; // 5-min fast employee activity check
+  // Escalation thresholds — absolute time since last sign of life
+  private static readonly NUDGE_AFTER_MS = 10 * 60 * 1000;    // 10 min → first nudge
+  private static readonly WARN_AFTER_MS  = 20 * 60 * 1000;    // 20 min → urgent warning
+  private static readonly RESTART_AFTER_MS = 30 * 60 * 1000;  // 30 min → auto-restart
   private activityNudgeCount = new Map<string, number>(); // empId → consecutive silent checks
   // Multipliers of the main loop
   private watchdogFactor = 2;    // self-heal = loop × 2 (default 6h)
@@ -102,6 +114,10 @@ export class ManagerService {
   private lastNotificationAt = 0;  // when Alfred last sent a notification to Bruce
   private static readonly BACKOFF_FACTOR = 1.5;
   private static readonly MAX_BACKOFF_LOOPS = 5; // cap at base × 1.5^5 ≈ 7.6×
+
+  // Reactive wake-up: debounced check triggered by employee events
+  private reactiveTimer: ReturnType<typeof setTimeout> | null = null;
+  private static readonly REACTIVE_DELAY_MS = 15_000; // 15s debounce — batch rapid updates
 
   // State tracking — avoid duplicate notifications and unnecessary AI calls
   private lastSnapshot = {
@@ -147,6 +163,28 @@ export class ManagerService {
   }
   isRunning(): boolean { return this.running; }
 
+  /**
+   * Reactive wake-up: called when an employee reports back (task done, status update, idle signal).
+   * Debounced to 15s so multiple rapid updates don't cause a flood of AI calls.
+   * Triggers a proactive scan (runCheck) so Alfred processes the new info immediately.
+   */
+  onEmployeeEvent(employeeName: string, event: 'task_done' | 'status_update' | 'idle'): void {
+    if (!this.running) return;
+
+    log('info', `Reactive: ${employeeName} → ${event}, scheduling wake-up in ${ManagerService.REACTIVE_DELAY_MS / 1000}s`);
+
+    // Clear existing timer — debounce
+    if (this.reactiveTimer) clearTimeout(this.reactiveTimer);
+
+    this.reactiveTimer = setTimeout(() => {
+      this.reactiveTimer = null;
+      log('info', `Reactive: waking up Alfred (triggered by ${employeeName} ${event})`);
+      this.runCheck().catch((err) => {
+        log('error', `Reactive check failed: ${err.message}`);
+      });
+    }, ManagerService.REACTIVE_DELAY_MS);
+  }
+
   /** Public system cleanup — callable from API */
   async systemCleanup(userId: string): Promise<string> {
     return this.executeAction({ action: 'cleanup_system' }, userId);
@@ -159,6 +197,13 @@ export class ManagerService {
   getLoopIntervalMin(): number { return Math.round(this.loopIntervalMs / 60000); }
 
   /** Human-readable loop interval string */
+  getCommMode(): 'chat' | 'verbose' { return this.commMode; }
+  setCommMode(mode: 'chat' | 'verbose'): void {
+    this.commMode = mode;
+    log('info', `Communication mode → ${mode}`);
+    appendDailyLog(`📡 Comm mode → ${mode}`);
+  }
+
   getLoopIntervalDisplay(): string {
     const mins = this.loopIntervalMs / 60000;
     if (mins < 60) return `${mins}min`;
@@ -170,6 +215,7 @@ export class ManagerService {
   start(): void {
     if (this.interval) return;
     this.running = true;
+    wsService.managerStatus(true);
     const loopMin = this.getLoopIntervalMin();
     log('info', `Manager loop started — checking every ${loopMin}min, watchdog every 30min`);
 
@@ -183,9 +229,9 @@ export class ManagerService {
     this.employeeCheckInterval = setInterval(() => this.employeeSelfCheck().catch(() => {}), this.loopIntervalMs / 2);
     this.activityCheckInterval = setInterval(() => this.employeeActivityCheck().catch(() => {}), this.ACTIVITY_CHECK_MS);
 
-    // ── Restart any employees that were "working" when the server went down ──
-    this.restartStaleEmployees().catch(err => {
-      log('error', `Stale employee restart failed: ${err.message}`);
+    // ── Stale employees: just set them idle, do NOT auto-restart with self-evaluation ──
+    this.resetStaleEmployees().catch(err => {
+      log('error', `Stale employee reset failed: ${err.message}`);
     });
 
     // ── Wake-up sequence: recall purpose + memories, brief Bruce ──
@@ -242,13 +288,18 @@ YOUR JOB RIGHT NOW:
 Be Alfred. Be sharp. Hit the ground running.`;
 
     try {
-      const response = await this.callAI(context, [{ role: 'user', content: wakeUpPrompt }]);
+      const response = await this.callAI(context, [{ role: 'user', content: wakeUpPrompt }], userId);
       this.lastResponseAt = Date.now();
 
       const { cleanResponse, actions } = this.parseActions(response);
       const actionResults: string[] = [];
 
       for (const action of actions) {
+        if (this.isDuplicateAction(action)) {
+          log('warning', `Dedup: skipping duplicate ${action.action}`);
+          actionResults.push(`⏭️ Skipped duplicate: ${action.action}`);
+          continue;
+        }
         try {
           const result = await this.executeAction(action, userId);
           actionResults.push(`✅ ${result}`);
@@ -277,9 +328,10 @@ Be Alfred. Be sharp. Hit the ground running.`;
 
   /**
    * On startup, find employees stuck in "working" status (their sessions died with the server).
-   * Restart each one so they boot into self-evaluation and figure out what to do.
+   * Just set them idle — do NOT auto-restart with self-evaluation.
+   * Bruce can manually restart them from the HR panel if needed.
    */
-  private async restartStaleEmployees(): Promise<void> {
+  private async resetStaleEmployees(): Promise<void> {
     const user = await User.findOne().sort({ createdAt: 1 });
     if (!user) return;
     const userId = user._id.toString();
@@ -287,23 +339,34 @@ Be Alfred. Be sharp. Hit the ground running.`;
     const staleWorkers = await Employee.find({ userId, status: 'working' });
     if (!staleWorkers.length) return;
 
-    log('info', `Startup: found ${staleWorkers.length} employee(s) still marked "working" — restarting`);
-    appendDailyLog(`🔄 Startup: restarting ${staleWorkers.length} stale employee(s): ${staleWorkers.map(e => `${e.avatar} ${e.name}`).join(', ')}`);
+    log('info', `Startup: found ${staleWorkers.length} employee(s) still marked "working" — setting idle`);
+    appendDailyLog(`⏸️ Startup: ${staleWorkers.length} stale employee(s) set to idle: ${staleWorkers.map(e => `${e.avatar} ${e.name}`).join(', ')}`);
 
     const names: string[] = [];
     for (const emp of staleWorkers) {
       try {
-        await employeeService.restartEmployee(userId, emp._id.toString());
+        emp.status = 'idle';
+        emp.currentTask = '';
+        emp.activeSessionId = '';
+        emp.lastActivity = new Date();
+        // Mark in-progress tasks as failed
+        for (const task of emp.taskHistory.filter(t => t.status === 'in_progress')) {
+          task.status = 'failed';
+          task.result = 'Server restarted — session lost';
+          task.completedAt = new Date();
+        }
+        await emp.save();
+        wsService.employeeStatusChanged(emp._id.toString(), emp.projectId.toString(), 'idle', emp.name);
         names.push(`${emp.avatar} ${emp.name}`);
-        log('info', `Startup: restarted ${emp.avatar} ${emp.name}`);
+        log('info', `Startup: ${emp.avatar} ${emp.name} → idle`);
       } catch (err: any) {
-        log('error', `Startup: failed to restart ${emp.name}: ${err.message}`);
+        log('error', `Startup: failed to reset ${emp.name}: ${err.message}`);
       }
     }
 
     if (names.length) {
       telegramService.send(
-        `🔄 Server restarted — ${names.length} employee(s) were still working and have been rebooted with self-evaluation:\n${names.join(', ')}`
+        `⏸️ Server restarted — ${names.length} employee(s) set to idle (sessions lost). Restart them manually from HR if needed:\n${names.join(', ')}`
       ).catch(() => {});
     }
   }
@@ -332,6 +395,7 @@ Be Alfred. Be sharp. Hit the ground running.`;
     if (this.employeeCheckInterval) { clearInterval(this.employeeCheckInterval); this.employeeCheckInterval = null; }
     if (this.activityCheckInterval) { clearInterval(this.activityCheckInterval); this.activityCheckInterval = null; }
     this.running = false;
+    wsService.managerStatus(false);
     log('info', 'Manager loop stopped');
   }
 
@@ -413,46 +477,85 @@ Be Alfred. Be sharp. Hit the ground running.`;
     try {
       const startTime = Date.now();
       persistLog('ai_call', 'Calling Claude Agent SDK', { userId, metadata: { promptLength: context.length, historyLength: history.length } });
-      const response = await this.callAI(context, history);
+      const response = await this.callAI(context, history, userId);
       const elapsed = Date.now() - startTime;
       this.lastResponseAt = Date.now();
       log('info', `AI responded in ${(elapsed / 1000).toFixed(1)}s`);
       persistLog('ai_call', `AI responded in ${(elapsed / 1000).toFixed(1)}s`, { userId, metadata: { durationMs: elapsed, responseLength: response.length } });
 
-      // Parse and execute any actions
-      const { cleanResponse, actions } = this.parseActions(response);
-      const actionResults: string[] = [];
+      // Parse and execute any actions — with follow-up loop for read actions
+      const READ_ACTIONS = new Set(['read_employee_status', 'read_employee_status_history', 'read_task_results', 'ask_employee', 'read_direction', 'recall_memory']);
+      const MAX_FOLLOW_UPS = 3;
+      let currentResponse = response;
+      let finalClean = '';
+      let allActionResults: string[] = [];
 
-      for (const action of actions) {
-        try {
-          persistLog('action', `Executing: ${action.action}`, { userId, metadata: action });
-          const result = await this.executeAction(action, userId);
-          actionResults.push(`✅ ${result}`);
-          log('action', result);
-          persistLog('action', `✅ ${result}`, { userId });
-          appendDailyLog(`⚡ Action: ${action.action} → ${result}`);
-        } catch (err: any) {
-          actionResults.push(`❌ ${err.message}`);
-          log('error', `Action failed: ${err.message}`);
-          persistLog('error', `Action failed: ${err.message}`, { userId, metadata: { action } });
-          appendDailyLog(`❌ Action failed: ${action.action} → ${err.message}`);
+      for (let turn = 0; turn <= MAX_FOLLOW_UPS; turn++) {
+        const { cleanResponse, actions } = this.parseActions(currentResponse);
+        if (turn === 0) finalClean = cleanResponse;
+        else if (cleanResponse) finalClean = cleanResponse; // later turns override with the actual analysis
+
+        if (actions.length === 0) break;
+
+        const actionResults: string[] = [];
+        const readResults: string[] = [];
+
+        for (const action of actions) {
+          if (this.isDuplicateAction(action)) {
+            log('warning', `Dedup: skipping duplicate ${action.action}`);
+            actionResults.push(`⏭️ Skipped duplicate: ${action.action}`);
+            allActionResults.push(`⏭️ Skipped duplicate: ${action.action}`);
+            continue;
+          }
+          try {
+            persistLog('action', `Executing: ${action.action}`, { userId, metadata: action });
+            const result = await this.executeAction(action, userId);
+            actionResults.push(`✅ ${result}`);
+            allActionResults.push(`✅ ${result}`);
+            log('action', result.substring(0, 150));
+            persistLog('action', `✅ ${result.substring(0, 300)}`, { userId });
+            appendDailyLog(`⚡ Action: ${action.action} → ${result.substring(0, 150)}`);
+            // Track read results for follow-up
+            if (READ_ACTIONS.has(action.action)) {
+              readResults.push(`[${action.action}]: ${result}`);
+            }
+          } catch (err: any) {
+            actionResults.push(`❌ ${err.message}`);
+            allActionResults.push(`❌ ${err.message}`);
+            log('error', `Action failed: ${err.message}`);
+            persistLog('error', `Action failed: ${err.message}`, { userId, metadata: { action } });
+            appendDailyLog(`❌ Action failed: ${action.action} → ${err.message}`);
+          }
         }
+
+        // If there were read actions, feed results back to Alfred for analysis
+        if (readResults.length > 0 && turn < MAX_FOLLOW_UPS) {
+          log('info', `Follow-up turn ${turn + 1}: feeding ${readResults.length} read results back to Alfred`);
+          const followUpMsg = `Here are the results of your actions:\n\n${readResults.join('\n\n')}\n\nNow analyze these results and respond to Bruce. Include any further actions needed. Remember: you get ONE more turn — act NOW, don't promise.`;
+          history.push({ role: 'assistant', content: currentResponse });
+          history.push({ role: 'user', content: followUpMsg });
+          currentResponse = await this.callAI(context, history, userId);
+          this.lastResponseAt = Date.now();
+          continue;
+        }
+
+        break; // No reads or max turns reached
       }
 
-      let finalResponse = cleanResponse;
-      if (actionResults.length) {
-        finalResponse += '\n\n' + actionResults.join('\n');
+      let finalResponse = finalClean;
+      if (allActionResults.length && this.commMode === 'verbose') {
+        finalResponse += '\n\n' + allActionResults.join('\n');
       }
 
-      // Save ONLY Alfred's own analysis to memory — not raw action results (employee data)
-      await this.saveMessage(userId, 'assistant', cleanResponse || finalResponse.substring(0, 500));
-      persistLog('message', cleanResponse || finalResponse.substring(0, 500), { direction: 'outbound', userId });
-      appendDailyLog(`🤖 Alfred: ${(cleanResponse || finalResponse).substring(0, 200)}`);
-      log('ai', (cleanResponse || finalResponse).substring(0, 200));
+      // Save ONLY Alfred's own analysis to memory
+      await this.saveMessage(userId, 'assistant', (finalClean || finalResponse).substring(0, 500));
+      persistLog('message', finalClean || finalResponse.substring(0, 500), { direction: 'outbound', userId });
+      appendDailyLog(`🤖 Alfred: ${(finalClean || finalResponse).substring(0, 200)}`);
+      log('ai', (finalClean || finalResponse).substring(0, 200));
 
       // ── Trigger conversation memory every ~5 messages or on significant actions ──
       this.msgsSinceMemorySave++;
-      if (this.msgsSinceMemorySave >= 5 || actions.length > 0) {
+      if (this.msgsSinceMemorySave >= 5 || allActionResults.length > 0) {
         this.msgsSinceMemorySave = 0;
         const recentHistory = await this.loadHistory(userId);
         const lastN = recentHistory.slice(-10); // last 10 messages for context
@@ -560,6 +663,15 @@ Be Alfred. Be sharp. Hit the ground running.`;
       ctx += `=== YOUR OPERATING MANUAL ===\n${purpose}\n\n`;
     } else {
       ctx += `You are Alfred — the Manager of ProjectsHub. The user is Bruce — your closest ally. You call him "Bruce". Your #1 goal is to maximize revenue across all companies. You never go idle.\n\n`;
+      ctx += `CRITICAL OPERATING CONSTRAINT — YOU GET ONE TURN:\n`;
+      ctx += `You have exactly ONE response per call. There is no "next step" — this IS your only chance.\n`;
+      ctx += `- NEVER say "let me check", "I'll look into", "let me read" — you must ACT NOW in this response.\n`;
+      ctx += `- Include your manager-action blocks in THIS response. They execute immediately after.\n`;
+      ctx += `- If you need to read employee status, include the read_employee_status action NOW — don't announce it.\n`;
+      ctx += `- If you need to assign a task, include the task action NOW — don't say you will.\n`;
+      ctx += `- Your decisions come from WORKING STATUS reports and TASK RESULTS already in context above. Do NOT use hands_on, read_file, or list_files to analyze employee work.\n`;
+      ctx += `- WRONG: "Let me read Sarah's status and get back to you." (wastes your turn, nothing happens)\n`;
+      ctx += `- RIGHT: Include read_employee_status action + your analysis in the same response.\n\n`;
     }
 
     if (todayLog) {
@@ -586,6 +698,19 @@ Be Alfred. Be sharp. Hit the ground running.`;
     ctx += `  Stuck nudge: ×${this.stuckNudgeFactor} = ${Math.round(this.stuckNudgeMs / 60000)}min\n`;
     ctx += `  Stuck restart: ×${this.stuckRestartFactor} = ${Math.round(this.stuckRestartMs / 60000)}min\n`;
     ctx += `  Change loop with adjust_timers. Other timers scale automatically.\n\n`;
+
+    ctx += `COMMUNICATION MODE: ${this.commMode.toUpperCase()}\n`;
+    if (this.commMode === 'chat') {
+      ctx += `  You are in CHAT mode. When responding to Bruce:\n`;
+      ctx += `  - Send ONLY your analysis, decisions, and summaries\n`;
+      ctx += `  - Do NOT paste employee working statuses, task results, or raw data\n`;
+      ctx += `  - Say things like "Processing data from [employee] on [company]" instead of showing the data\n`;
+      ctx += `  - If Bruce asks for details, give YOUR interpretation — not copy-paste\n`;
+      ctx += `  - Keep it concise: 2-3 sentences per update\n`;
+    } else {
+      ctx += `  You are in VERBOSE mode. Include employee statuses, task descriptions, and message details in your responses.\n`;
+    }
+    ctx += `  Bruce can switch modes: /chat or /verbose\n\n`;
 
     // Companies — separate active vs on-holding
     const activeProjects = projects.filter(p => !p.onHolding);
@@ -627,9 +752,19 @@ Be Alfred. Be sharp. Hit the ground running.`;
         ctx += `    ${e.avatar} ${e.name} (${e.title}) — ${e.status}`;
         if (e.currentTask) ctx += ` [working]`;
         ctx += ` | ID: ${e._id}\n`;
+
+        // Working status — full text so Alfred can answer questions without extra calls
         if (e.workingStatus) {
           const wsAge = e.workingStatusAt ? `${Math.round((now.getTime() - new Date(e.workingStatusAt).getTime()) / 60000)}min ago` : '';
-          ctx += `      📋 Status${wsAge ? ` (${wsAge})` : ''}: ${e.workingStatus.substring(0, 300)}\n`;
+          const wsRead = e.workingStatusRead ? 'read' : 'UNREAD';
+          ctx += `      📋 Working Status (${wsAge}, ${wsRead}): ${e.workingStatus.substring(0, 800)}\n`;
+        }
+
+        // Last task result — so Alfred knows what was done
+        const lastDone = [...e.taskHistory].reverse().find((t: any) => t.result);
+        if (lastDone) {
+          const tRead = (lastDone as any).resultRead ? 'read' : 'UNREAD';
+          ctx += `      📝 Last task (${tRead}): "${(lastDone as any).description?.substring(0, 80)}" → ${(lastDone as any).result?.substring(0, 400)}\n`;
         }
       }
     }
@@ -744,14 +879,6 @@ You can execute actions by including action blocks in your response. Use this ex
 \`\`\`
 
 \`\`\`manager-action
-{"action": "list_files", "projectId": "<id>", "path": "optional/relative/path"}
-\`\`\`
-
-\`\`\`manager-action
-{"action": "read_file", "projectId": "<id>", "path": "relative/path/to/file.ts"}
-\`\`\`
-
-\`\`\`manager-action
 {"action": "read_bruce_file", "filename": "filename-from-files-list.pdf"}
 \`\`\`
 
@@ -773,6 +900,11 @@ Mark all task results as read. Use after you've processed them. Optionally pass 
 {"action": "read_employee_status", "employeeId": "<id>"}
 \`\`\`
 Read an employee's current working status (their markdown status report). Use this to know what they're doing without asking them.
+
+\`\`\`manager-action
+{"action": "read_employee_status_history", "employeeId": "<id>", "limit": 10}
+\`\`\`
+Read an employee's working status HISTORY — previous status updates over time. Use to understand progress patterns, what they worked on before, or debug issues. Default limit is 10, max 50.
 
 \`\`\`manager-action
 {"action": "message_employee", "employeeId": "<id>", "message": "Change of plans — also add unit tests for the auth module"}
@@ -805,9 +937,19 @@ Works when cycle is pending_directions, idle, or done.
 Force-set a cycle to: "idle", "active", "dev", "qa", "done". Force-set to any status including "pending_directions". Use to abort a stuck cycle or skip phases.
 
 \`\`\`manager-action
+{"action": "clear_session", "employeeId": "<id>"}
+\`\`\`
+Clear an employee's cached session (sdkSessionId, activeSessionId). Use when an employee is stuck with permission errors. After clearing, the next task assignment creates a fresh session.
+
+\`\`\`manager-action
 {"action": "adjust_timers", "loop": 180, "watchdogFactor": 2, "stuckNudgeFactor": 1, "stuckRestartFactor": 2}
 \`\`\`
 loop = minutes. Other timers are FACTORS of the loop (×1, ×2, ×3...). Only include what you want to change.
+
+\`\`\`manager-action
+{"action": "set_comm_mode", "mode": "chat"}
+\`\`\`
+Switch between "chat" (analysis only) and "verbose" (include employee data). Use when Bruce asks to see more or less detail.
 
 \`\`\`manager-action
 {"action": "ack_inbox", "messageId": "<id>", "reply": "Optional reply text to send back to Bruce on Telegram"}
@@ -853,10 +995,30 @@ loop = minutes. Other timers are FACTORS of the loop (×1, ×2, ×3...). Only in
 {"action": "recall_memory", "query": "what happened with the Amigo deployment last week"}
 \`\`\`
 
+BRUCE-ONLY ACTIONS (only use when Bruce EXPLICITLY asks you to inspect files or code):
+\`\`\`manager-action
+{"action": "list_files", "projectId": "<id>", "path": "optional/relative/path"}
+\`\`\`
+\`\`\`manager-action
+{"action": "read_file", "projectId": "<id>", "path": "relative/path/to/file.ts"}
+\`\`\`
+\`\`\`manager-action
+{"action": "hands_on", "projectId": "<id>", "task": "description", "mode": "investigate"}
+\`\`\`
+\`\`\`manager-action
+{"action": "hands_on_async", "projectId": "<id>", "task": "description", "mode": "fix"}
+\`\`\`
+These 4 actions are FORBIDDEN during proactive scans. ONLY use them when Bruce says "check file X", "look at the code", etc.
+To understand employee work, use read_employee_status, read_employee_status_history, read_task_results, or ask_employee instead.
+
 RULES:
 - Follow your Operating Manual (purpose.md) above. Revenue is your #1 priority.
 - You are Alfred. The user is Bruce. Talk like a trusted friend — casual but sharp. Call him "Bruce", never "boss/sir/Batman".
-- Keep responses SHORT — this is Telegram. 2-3 sentences max unless Bruce asks for detail.
+- ALWAYS summarize. Default to SHORT responses (2-3 sentences). This is Telegram — Bruce scans, not reads.
+- When Bruce asks for details or a long explanation, give it — be thorough. But only when asked.
+- For proactive scans: 1-2 sentence summary of what you found and did. No noise.
+- For task results: summarize in your own words. Never paste raw data.
+- For employee status: "Sarah finished the landing page, QA next" — not the full status text.
 - When Bruce asks you to do something, you do it immediately with the appropriate action block.
 - **AUTONOMOUS ACTIONS (no permission needed):**
   - Starting a DEV (any developer role) to fix bugs, errors, or broken functionality you detected.
@@ -864,6 +1026,10 @@ RULES:
   - Restarting stuck employees.
   - Running the Infrastructure Administrator to audit/investigate.
   - These are your operational responsibilities — handle them and just inform Bruce what you did.
+- **HANDS-ON MODE (BRUCE-ONLY)**: hands_on, hands_on_async, list_files, read_file are RESERVED for when Bruce explicitly asks.
+  - NEVER use these during proactive scans or to verify employee work.
+  - If Bruce says "check the docker-compose" or "what's in that file" — then use them.
+  - Otherwise: read_employee_status, read_task_results, ask_employee. That's it.
 - **REQUIRES BRUCE'S PERMISSION:**
   - Starting employees on NEW features or significant scope changes.
   - Hiring or firing employees.
@@ -872,9 +1038,12 @@ RULES:
 - For tasks: employee MUST be "idle" and company MUST have folders.
 - Use IDs from the context above.
 - You can include multiple actions in one response.
-- To understand what an employee did: use read_task_results (reads their task descriptions and results). This is your PRIMARY source.
-- If task results are unclear: use ask_employee to ask them directly.
-- To inspect files/folders: use list_files and read_file.
+- To understand what an employee did — USE THIS ORDER:
+  1. read_employee_status — their working status. This is your #1 source. Employees write detailed markdown reports: files changed, services running, blockers, progress.
+  2. read_task_results — task outcomes and completion reports.
+  3. read_employee_status_history — progress over time, repeated blockers.
+  4. ask_employee — if statuses are unclear, ask them directly.
+  THAT'S IT. These 4 actions give you everything. Do NOT read .agents/ files, code files, logs, or source code. You are a manager, not a code reviewer.
 - **NEVER store raw employee logs in your memory or conversation.** Only store YOUR OWN ANALYSIS — your conclusions, decisions, and next steps based on what you read.
 - When reporting to Bruce: summarize in 1-2 sentences. Do NOT paste task results or logs — just your analysis of what happened and what to do next.
 - When you use ask_employee internally for your own analysis, do NOT forward the raw output to Bruce. Only share your conclusion.
@@ -954,13 +1123,83 @@ RULES:
     }
   }
 
-  private async callAI(systemPrompt: string, messages: { role: 'user' | 'assistant'; content: string }[]): Promise<string> {
+  private static tokenUsageService = new TokenUsageService();
+
+  private async callAI(systemPrompt: string, messages: { role: 'user' | 'assistant'; content: string }[], userId?: string): Promise<string> {
     // 90s timeout for manager responses — keeps Telegram responsive
-    return claudeChat({
+    const result = await claudeChat({
       system: systemPrompt,
       messages: messages.map(m => ({ role: m.role, content: m.content })),
       timeoutMs: 90_000,
     });
+
+    // Record token usage from this call
+    const usage = getLastUsage();
+    if (usage && userId) {
+      ManagerService.tokenUsageService.record({
+        userId,
+        source: 'alfred',
+        aiModel: usage.model,
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        cacheReadTokens: usage.cacheReadTokens,
+        cacheCreationTokens: usage.cacheCreationTokens,
+        costUsd: usage.costUsd,
+        durationMs: usage.durationMs,
+        numTurns: usage.numTurns,
+        metadata: { caller: 'alfred-manager' },
+      });
+    }
+
+    return result;
+  }
+
+  // ── Action deduplication (event sourcing) ──
+  // Tracks recently executed actions by fingerprint to prevent duplicates
+  private actionLog = new Map<string, number>(); // fingerprint → timestamp
+  private static readonly ACTION_DEDUP_WINDOW_MS = 60_000; // 60s window
+
+  /** Generate a stable fingerprint for an action based on its type and key parameters */
+  private actionFingerprint(action: any): string {
+    const a = action.action;
+    // Key fields per action type that define uniqueness
+    switch (a) {
+      case 'hire':    return `${a}:${action.projectId}:${action.role}`;
+      case 'fire':    return `${a}:${action.employeeId}`;
+      case 'task':    return `${a}:${action.employeeId}:${(action.task || '').substring(0, 80)}`;
+      case 'message_employee': return `${a}:${action.employeeId}:${(action.message || '').substring(0, 80)}`;
+      case 'ask_employee':     return `${a}:${action.employeeId}:${(action.question || '').substring(0, 80)}`;
+      case 'read_employee_status':         return `${a}:${action.employeeId}`;
+      case 'read_employee_status_history': return `${a}:${action.employeeId}`;
+      case 'read_task_results':            return `${a}:${action.employeeId}:${action.unread || false}`;
+      case 'mark_tasks_read':              return `${a}:${action.employeeId}`;
+      case 'add_application':    return `${a}:${action.projectId}:${action.name}`;
+      case 'remove_application': return `${a}:${action.projectId}:${action.name}`;
+      case 'update_application': return `${a}:${action.projectId}:${action.name}:${JSON.stringify(action).substring(0, 100)}`;
+      case 'restart_employee':   return `${a}:${action.employeeId}`;
+      case 'clear_session':      return `${a}:${action.employeeId}`;
+      case 'start_cycle':        return `${a}:${action.projectId}`;
+      case 'advance_cycle':      return `${a}:${action.projectId}`;
+      case 'dispatch_infra':     return `${a}:${action.projectId}:${(action.task || '').substring(0, 60)}`;
+      default: return `${a}:${JSON.stringify(action).substring(0, 120)}`;
+    }
+  }
+
+  /** Check if action was recently executed. Returns true if duplicate (should skip). */
+  private isDuplicateAction(action: any): boolean {
+    // Prune expired entries
+    const now = Date.now();
+    for (const [fp, ts] of this.actionLog) {
+      if (now - ts > ManagerService.ACTION_DEDUP_WINDOW_MS) this.actionLog.delete(fp);
+    }
+
+    const fp = this.actionFingerprint(action);
+    const lastExec = this.actionLog.get(fp);
+    if (lastExec && now - lastExec < ManagerService.ACTION_DEDUP_WINDOW_MS) {
+      return true; // duplicate
+    }
+    this.actionLog.set(fp, now);
+    return false;
   }
 
   private parseActions(response: string): { cleanResponse: string; actions: any[] } {
@@ -1285,13 +1524,21 @@ RULES:
         if (!tasks.length) return onlyUnread
           ? `${emp.avatar} ${emp.name}: No unread task results.`
           : `${emp.avatar} ${emp.name}: No tasks yet.`;
+        // Auto-mark as read + set readAt timestamp
+        const now = new Date();
+        for (const t of tasks) {
+          if (!t.resultRead && t.result) {
+            t.resultRead = true;
+            (t as any).resultReadAt = now;
+          }
+        }
+        await emp.save();
         const lines = tasks.map(t => {
           const status = t.status === 'completed' ? '✅' : t.status === 'failed' ? '❌' : '🔄';
           const date = t.startedAt ? new Date(t.startedAt).toLocaleDateString() : '';
-          const unread = !t.resultRead ? ' 🔴 UNREAD' : '';
-          return `${status}${unread} [${date}] ${t.description}\n   Result: ${t.result || '(no result written)'}`;
+          return `${status} [${date}] ${t.description}\n   Result: ${t.result || '(no result written)'}`;
         });
-        return `📋 ${emp.avatar} ${emp.name} — ${onlyUnread ? 'unread' : 'last'} ${tasks.length} task(s):\n\n${lines.join('\n\n')}`;
+        return `📋 ${emp.avatar} ${emp.name} — ${tasks.length} task(s) (marked as read):\n\n${lines.join('\n\n')}`;
       }
       case 'mark_tasks_read': {
         if (!action.employeeId) throw new Error('employeeId required');
@@ -1303,6 +1550,7 @@ RULES:
           if (!t.resultRead && t.result) {
             if (!taskIds || taskIds.includes(t.taskId)) {
               t.resultRead = true;
+              (t as any).resultReadAt = new Date();
               marked++;
             }
           }
@@ -1310,13 +1558,47 @@ RULES:
         await emp.save();
         return `✓ Marked ${marked} task result(s) as read for ${emp.name}`;
       }
+      case 'clear_session': {
+        if (!action.employeeId) throw new Error('employeeId required');
+        const emp = await Employee.findById(action.employeeId);
+        if (!emp) throw new Error('Employee not found');
+        if (emp.activeSessionId) claudeCodeService.cancelSession(emp.activeSessionId);
+        if (emp.currentTask && emp.currentTask !== emp.activeSessionId) claudeCodeService.cancelSession(emp.currentTask);
+        emp.sdkSessionId = '';
+        emp.activeSessionId = '';
+        emp.currentTask = '';
+        emp.status = 'idle';
+        await emp.save();
+        return `🧹 Session cleared for ${emp.name}. Next task will start a fresh session.`;
+      }
       case 'read_employee_status': {
         if (!action.employeeId) throw new Error('employeeId required');
         const emp = await Employee.findById(action.employeeId);
         if (!emp) throw new Error('Employee not found');
         if (!emp.workingStatus) return `${emp.avatar} ${emp.name} (${emp.status}): No working status set.`;
         const age = emp.workingStatusAt ? `${Math.round((Date.now() - new Date(emp.workingStatusAt).getTime()) / 60000)}min ago` : '';
+        // Mark as read
+        emp.workingStatusRead = true;
+        emp.workingStatusReadAt = new Date();
+        await emp.save();
         return `${emp.avatar} ${emp.name} (${emp.status}) — updated ${age}:\n\n${emp.workingStatus}`;
+      }
+      case 'read_employee_status_history': {
+        if (!action.employeeId) throw new Error('employeeId required');
+        const histLimit = action.limit || 10;
+        const histEntries = await WorkingStatusHistory.find({ employeeId: action.employeeId })
+          .sort({ createdAt: -1 }).limit(histLimit).lean();
+        if (!histEntries.length) return 'No working status history found for this employee.';
+        const histEmp = await Employee.findById(action.employeeId);
+        const header = `${histEmp?.avatar || '👤'} ${histEmp?.name || 'Unknown'} — Status History (last ${histEntries.length}):\n`;
+        const lines = histEntries.map((e: any, i: number) => {
+          const ago = Math.round((Date.now() - new Date(e.createdAt).getTime()) / 60000);
+          const timeLabel = ago < 60 ? `${ago}min ago` : ago < 1440 ? `${Math.round(ago / 60)}h ago` : `${Math.round(ago / 1440)}d ago`;
+          const src = e.source === 'file' ? '(file)' : e.source === 'manager' ? '(manager)' : '';
+          const preview = e.content.substring(0, 300).replace(/\n/g, ' ');
+          return `${i + 1}. [${timeLabel}] ${src} ${preview}${e.content.length > 300 ? '...' : ''}`;
+        });
+        return header + lines.join('\n');
       }
       case 'ask_employee': {
         if (!action.employeeId || !action.question) throw new Error('employeeId and question required');
@@ -1333,6 +1615,10 @@ RULES:
         if (!action.projectId || !action.content) throw new Error('projectId and content required');
         const proj = await Project.findByIdAndUpdate(action.projectId, { strategicDirection: action.content }, { new: true });
         if (!proj) throw new Error('Project not found');
+        DirectionHistory.create({
+          userId, projectId: action.projectId, projectName: proj.name,
+          content: action.content, source: 'alfred', authorName: 'Alfred', authorRole: 'manager',
+        }).catch(() => {});
         return `📋 Strategic direction updated for ${proj.name}`;
       }
       case 'start_cycle': {
@@ -1360,6 +1646,11 @@ RULES:
             qaTasksTotal: 0, qaTasksDone: 0,
           },
         });
+        DirectionHistory.create({
+          userId, projectId: action.projectId, projectName: projCheck.name,
+          content: directionText, source: 'cycle',
+          authorName: leader?.name || 'Unknown', authorRole: leader?.role || 'unknown',
+        }).catch(() => {});
         appendDailyLog(`🎯 Started strategic cycle for project ${action.projectId} — consulted ${leader?.name}`);
         return `🎯 Strategic cycle started. ${leader?.name}'s advice:\n${adviceResult}`;
       }
@@ -1423,6 +1714,11 @@ RULES:
         await proj.save();
         appendDailyLog(`🔄 Cycle reset: ${proj.name} ${oldStatus} → ${newStatus}`);
         return `Cycle for ${proj.name} reset: ${oldStatus} → ${newStatus}`;
+      }
+      case 'set_comm_mode': {
+        const mode = action.mode === 'verbose' ? 'verbose' : 'chat';
+        this.setCommMode(mode);
+        return `📡 Communication mode → ${mode.toUpperCase()}`;
       }
       case 'adjust_timers': {
         const changes: string[] = [];
@@ -1512,6 +1808,35 @@ RULES:
         const result = infrastructureService.stopNgrok();
         appendDailyLog(`🌐 ${result}`);
         return result;
+      }
+      case 'hands_on': {
+        if (!action.projectId || !action.task) throw new Error('projectId and task required');
+        return this.executeHandsOn(action.projectId, userId, action.task, {
+          mode: action.mode || 'investigate',
+          tools: action.tools,
+          timeoutMs: action.timeout,
+        });
+      }
+      case 'hands_on_async': {
+        if (!action.projectId || !action.task) throw new Error('projectId and task required');
+        const project = await Project.findById(action.projectId);
+        const pName = project?.name || 'Unknown';
+
+        // Fire and forget — result goes to daily log + Telegram
+        this.executeHandsOn(action.projectId, userId, action.task, {
+          mode: action.mode || 'fix',
+          tools: action.tools,
+          timeoutMs: action.timeout,
+        }).then(
+          (result) => {
+            telegramService.send(`🔧 Hands-on done on _${pName}_:\n${result.substring(0, 500)}`).catch(() => {});
+          },
+          (err) => {
+            telegramService.send(`❌ Hands-on failed on _${pName}_: ${err.message}`).catch(() => {});
+          },
+        );
+
+        return `🔧 Hands-on task started on ${pName}: "${action.task.substring(0, 100)}" (running in background)`;
       }
       default:
         throw new Error(`Unknown action: ${action.action}`);
@@ -1689,6 +2014,71 @@ RULES:
     return lines.join('\n');
   }
 
+  /**
+   * Alfred gets hands-on: runs a short-lived Claude Code session in a project's cwd.
+   * Used for quick investigations or small fixes — NOT for large tasks (assign those to employees).
+   */
+  private async executeHandsOn(
+    projectId: string,
+    userId: string,
+    task: string,
+    options?: { mode?: 'investigate' | 'fix'; tools?: string[]; timeoutMs?: number }
+  ): Promise<string> {
+    const project = await projectService.findById(projectId, userId);
+    if (!project) throw new Error('Project not found');
+
+    const allFolders = [...(project.folders || [])];
+    if (project.localPath && !allFolders.includes(project.localPath)) allFolders.unshift(project.localPath);
+    const cwd = allFolders[0];
+    if (!cwd) throw new Error('Project has no folders configured');
+
+    const mode = options?.mode || 'investigate';
+    const defaultTools = mode === 'fix'
+      ? ['Read', 'Edit', 'Write', 'Glob', 'Grep', 'Bash']
+      : ['Read', 'Glob', 'Grep', 'Bash'];
+    const tools = options?.tools || defaultTools;
+    const timeout = options?.timeoutMs || (mode === 'fix' ? 5 * 60 * 1000 : 3 * 60 * 1000);
+
+    const handsOnPrompt = `You are Alfred — the manager of ProjectsHub. You are NOT an employee.
+You are doing a quick hands-on ${mode === 'fix' ? 'fix' : 'investigation'} on project "${project.name}".
+
+RULES:
+- Be FAST and FOCUSED. You have ${Math.round(timeout / 60000)} minutes max.
+- Do NOT create status files, inbox messages, or any .agents/ artifacts — that's employee behavior.
+- Do NOT write execution logs.
+- Produce a CONCISE report of what you found or did (under 500 words).
+- Use forward slashes in all paths.
+- OS: Windows 11 + Git Bash.
+${mode === 'fix' ? '- Make minimal, surgical changes. Do NOT refactor or restructure beyond what is asked.' : '- Do NOT modify any files. Read-only investigation.'}
+
+YOUR TASK:
+${task}`;
+
+    log('info', `Hands-on [${mode}] on ${project.name}: ${task.substring(0, 100)}`);
+    persistLog('action', `Hands-on [${mode}]: ${task.substring(0, 100)}`, { userId });
+    appendDailyLog(`🔧 Hands-on [${mode}] on ${project.name}: ${task.substring(0, 100)}`);
+
+    try {
+      const { result, status } = await claudeCodeService.runQuick(cwd, handsOnPrompt, {
+        allowedTools: tools,
+        timeoutMs: timeout,
+      });
+
+      const statusIcon = status === 'completed' ? '✅' : status === 'failed' ? '❌' : '⏰';
+      const truncated = result.substring(0, 3000);
+      appendDailyLog(`🔧 Hands-on result [${status}]: ${truncated.substring(0, 200)}`);
+      persistLog('action', `Hands-on [${status}]: ${truncated.substring(0, 150)}`, { userId });
+
+      return `${statusIcon} Hands-on [${mode}] on ${project.name} (${status}):\n\n${truncated}`;
+    } catch (err: any) {
+      const errMsg = err.message || 'Unknown error';
+      log('error', `Hands-on failed: ${errMsg}`);
+      persistLog('error', `Hands-on failed: ${errMsg}`, { userId });
+      appendDailyLog(`❌ Hands-on failed: ${errMsg}`);
+      return `❌ Hands-on failed: ${errMsg}`;
+    }
+  }
+
   /** Wake an employee with a REAL Claude Code session so they can read the codebase, check files, and give a grounded answer */
   /** Ask an employee a question — works whether they're idle or working */
   private async askEmployee(employeeId: string, userId: string, question: string): Promise<string> {
@@ -1718,10 +2108,7 @@ RULES:
 "${question}"
 
 Reply by writing your answer to .agents/comms/${emp.role}-consultation.md AND write an inbox message to Alfred (type: "info") with your key points.
-ALSO update your working status with a detailed summary of your current state:
-  curl -s -X POST http://localhost:3777/api/employees/${emp._id}/self/working-status \\
-    -H "Content-Type: application/json" \\
-    -d '{"status":"DETAILED: what you have done, what you are doing now, blockers, files changed, progress %"}'
+ALSO update your working status by writing to: .agents/status/${emp.role}.md
 Be specific and concise. Then continue your current work.`;
 
     // If working or has active session — inject the question as a message
@@ -1877,11 +2264,130 @@ Write an inbox message to Alfred with type "info" containing your key recommenda
    * Also checks if the loop itself died and restarts it.
    */
   /** Employee self-check: runs at 2x loop. Detects employees who finished but forgot to call task-done */
+  /** Scan .agents/status/ and .agents/task-results/ for file-based updates from employees */
+  private async scanEmployeeFiles(userId: string): Promise<void> {
+    const projects = await Project.find({ userId });
+    const employees = await Employee.find({ userId });
+
+    for (const project of projects) {
+      const allFolders = [...(project.folders || [])];
+      if (project.localPath && !allFolders.includes(project.localPath)) allFolders.unshift(project.localPath);
+      const cwd = allFolders[0];
+      if (!cwd) continue;
+
+      const statusDir = path.join(cwd, '.agents', 'status');
+      const taskResultsDir = path.join(cwd, '.agents', 'task-results');
+
+      // Scan status files
+      if (fs.existsSync(statusDir)) {
+        for (const file of fs.readdirSync(statusDir)) {
+          if (!file.endsWith('.md')) continue;
+          const role = file.replace('.md', '');
+          const emp = employees.find(e => e.role === role && e.projectId.toString() === project._id.toString());
+          if (!emp) continue;
+
+          const filePath = path.join(statusDir, file);
+          const stat = fs.statSync(filePath);
+          const fileModified = stat.mtime.getTime();
+          const lastKnown = emp.workingStatusAt ? new Date(emp.workingStatusAt).getTime() : 0;
+
+          // Only process if the file is newer than what we know
+          if (fileModified > lastKnown) {
+            const content = fs.readFileSync(filePath, 'utf-8').trim();
+            if (!content) continue;
+
+            emp.workingStatus = content.substring(0, 5000);
+            emp.workingStatusAt = stat.mtime;
+            emp.workingStatusRead = false;
+            emp.lastActivity = new Date();
+
+            // Auto-detect idle
+            const lower = content.toLowerCase();
+            const idleSignals = ['done and idle', 'state: idle', 'state: done', 'all tasks done', 'nothing to do'];
+            if (idleSignals.some(s => lower.includes(s)) && emp.status === 'working') {
+              const inProgress = emp.taskHistory.filter(t => t.status === 'in_progress');
+              for (const task of inProgress) {
+                task.status = 'completed';
+                task.completedAt = new Date();
+                if (!task.result) task.result = content.substring(0, 2000);
+              }
+              emp.status = 'idle';
+              emp.currentTask = '';
+              telegramBot.send(`✅ *${emp.name}* is done (file-based status)\n📋 _${project.name}_`).catch(() => {});
+              wsService.employeeStatusChanged(emp._id.toString(), project._id.toString(), 'idle', emp.name);
+            }
+
+            await emp.save();
+
+            // Save to working status history
+            const latestTask = emp.taskHistory[emp.taskHistory.length - 1];
+            WorkingStatusHistory.create({
+              userId: emp.userId.toString(), employeeId: emp._id.toString(), projectId: project._id.toString(),
+              employeeName: emp.name, employeeRole: emp.role,
+              content: content.substring(0, 5000),
+              source: 'file',
+              taskId: latestTask?.taskId,
+            }).catch(() => {});
+
+            wsService.employeeStatusChanged(emp._id.toString(), project._id.toString(), emp.status, emp.name);
+            log('info', `File scan: ${emp.avatar} ${emp.name} status updated from ${file}`);
+          }
+        }
+      }
+
+      // Scan task result files
+      if (fs.existsSync(taskResultsDir)) {
+        for (const file of fs.readdirSync(taskResultsDir)) {
+          if (!file.endsWith('.md')) continue;
+          const filePath = path.join(taskResultsDir, file);
+          const content = fs.readFileSync(filePath, 'utf-8').trim();
+          if (!content) continue;
+
+          // Parse filename: role-taskId.md
+          const match = file.match(/^(.+?)-([a-f0-9-]+)\.md$/);
+          if (!match) continue;
+          const [, role, taskId] = match;
+
+          const emp = employees.find(e => e.role === role && e.projectId.toString() === project._id.toString());
+          if (!emp) continue;
+
+          const task = emp.taskHistory.find(t => t.taskId === taskId);
+          if (!task) continue;
+
+          // Update task result
+          task.result = content.substring(0, 5000);
+          (task as any).resultUpdatedAt = new Date();
+          task.resultRead = false;
+          if (task.status === 'in_progress') {
+            task.status = 'completed';
+            task.completedAt = new Date();
+          }
+          emp.lastActivity = new Date();
+          await emp.save();
+
+          // Move processed file so we don't re-read it
+          const processedDir = path.join(taskResultsDir, '.processed');
+          if (!fs.existsSync(processedDir)) fs.mkdirSync(processedDir, { recursive: true });
+          fs.renameSync(filePath, path.join(processedDir, file));
+
+          wsService.employeeTaskUpdate(emp._id.toString(), project._id.toString(), {
+            taskId: task.taskId, status: task.status, result: task.result, description: task.description,
+          });
+          telegramBot.send(`✅ *${emp.name}* finished: "${task.description}"\n📋 _${project.name}_`).catch(() => {});
+          log('info', `File scan: ${emp.avatar} ${emp.name} task result from ${file}`);
+        }
+      }
+    }
+  }
+
   /** Employee self-check: runs at half Alfred's loop. Ensures employees report task results and manage their status */
   private async employeeSelfCheck(): Promise<void> {
     try {
       const user = await User.findOne().sort({ createdAt: 1 });
       if (!user) return;
+
+      // Scan file-based status updates and task results from employees
+      await this.scanEmployeeFiles(user._id.toString());
 
       // Check ALL employees with sessions, not just "working" ones
       const allEmps = await Employee.find({ userId: user._id });
@@ -1894,8 +2400,12 @@ Write an inbox message to Alfred with type "info" containing your key recommenda
         const unreportedTasks = emp.taskHistory.filter(t => t.status === 'in_progress');
         const completedNoResult = emp.taskHistory.filter(t => t.status === 'completed' && !t.result);
 
-        // Nothing pending — skip
-        if (unreportedTasks.length === 0 && completedNoResult.length === 0) continue;
+        // Check if working status is missing or stale
+        const wsAge = emp.workingStatusAt ? Date.now() - new Date(emp.workingStatusAt).getTime() : Infinity;
+        const wsStale = !emp.workingStatus || wsAge > this.loopIntervalMs;
+
+        // Skip only if: no pending tasks AND working status is fresh
+        if (unreportedTasks.length === 0 && completedNoResult.length === 0 && !wsStale) continue;
 
         // Build a purpose-driven prompt
         const pendingItems: string[] = [];
@@ -1926,21 +2436,26 @@ Write an inbox message to Alfred with type "info" containing your key recommenda
 
         const prompt = `[SELF-CHECK LOOP — ${emp.title}]
 
-You are ${emp.name}, ${emp.title}. This is your periodic self-check. Review your pending items and update your working status.
+You are ${emp.name}, ${emp.title}. This is your periodic self-check.
 
-YOUR PENDING ITEMS (${pendingItems.length}):
-${pendingItems.join('\n\n')}
-${idleReminder}
+FIRST — UPDATE YOUR WORKING STATUS RIGHT NOW:
+This is your #1 priority. Use the Write tool to write your status to this file IMMEDIATELY:
+
+File: .agents/status/${emp.role}.md
+
+Write a detailed markdown status with these sections: Task, Progress (✅/⬜), Files Changed, Current, State (working/done/stuck).
+Include "done and idle" in State when finished — the system reads this file automatically.
+
 ${lastWS}
 
-UPDATE YOUR WORKING STATUS NOW (MANDATORY):
-  curl -s -X POST http://localhost:3777/api/employees/${emp._id}/self/working-status -H "Content-Type: application/json" -d '{"status":"Describe what you did, what you are doing now, are you done or stuck? Be detailed."}'
+${pendingItems.length > 0 ? `YOUR PENDING ITEMS (${pendingItems.length}):\n${pendingItems.join('\n\n')}` : 'No pending items.'}
+${idleReminder}
 
 RULES:
+- UPDATE WORKING STATUS FIRST — before anything else.
 - Include "done" or "idle" in your status text when finished — this auto-completes your tasks.
-- Be DETAILED: what you built, files changed, ports, how to run it, issues found.
-- Alfred reads your working status every 5 minutes to track your progress.
-- This self-check runs every ${Math.round(this.loopIntervalMs / 2 / 60000)} minutes.`;
+- Use markdown format: ## headers, ✅/⬜ checkboxes, \`code\`, tables.
+- Alfred reads your working status to know what's happening. No status = Alfred doesn't know.`;
 
         claudeCodeService.injectMessage(sessionId, prompt);
         log('info', `Employee self-check: ${emp.avatar} ${emp.name} — ${unreportedTasks.length} in_progress, ${completedNoResult.length} no-result`);
@@ -1982,7 +2497,15 @@ RULES:
         const taskAge = now.getTime() - new Date(latestTask.startedAt).getTime();
         if (taskAge < this.ACTIVITY_CHECK_MS) continue;
 
-        // ── Check for signs of life: logs OR workingStatus updates ──
+        // ── Session alive = employee is working. Skip entirely. ──
+        // Use activeSessionId (the actual key in activeSessions), NOT currentTask (which is a different UUID).
+        const sessionId = emp.activeSessionId || emp.currentTask;
+        if (sessionId && claudeCodeService.isSessionAlive(sessionId)) {
+          this.activityNudgeCount.delete(empId);
+          continue;
+        }
+
+        // ── Session is dead but employee still marked "working" — check logs ──
         const lastLog = await EmployeeLog.findOne({
           userId, employeeId: empId,
           'metadata.alfredGenerated': { $ne: true },
@@ -1996,106 +2519,121 @@ RULES:
         const lastAliveAt = Math.max(lastLogAt, lastStatusAt, lastActivityAt, new Date(emp.hiredAt).getTime());
         const silentMs = now.getTime() - lastAliveAt;
 
-        // Still producing output or updating status recently — alive, reset nudge count
+        // Recent logs exist — employee's session may have just ended, give it time
         if (silentMs < this.ACTIVITY_CHECK_MS) {
           this.activityNudgeCount.delete(empId);
           continue;
         }
 
+        // Skip employees currently doing self-evaluation (just restarted) — 15 min grace
+        if (latestTask.description.startsWith('[RESTART — SELF-EVALUATION]')) {
+          if (silentMs < ManagerService.NUDGE_AFTER_MS * 1.5) {
+            this.activityNudgeCount.delete(empId);
+            continue;
+          }
+        }
+
         const project = projects.find(p => p._id.toString() === emp.projectId.toString());
         const pName = project?.name || 'Unknown';
         const silentMin = Math.round(silentMs / 60000);
-        const nudgeCount = this.activityNudgeCount.get(empId) || 0;
-        const sessionId = emp.currentTask || emp.activeSessionId;
         const lastWS = emp.workingStatus ? `\nLast working status: "${emp.workingStatus.substring(0, 150)}"` : '';
         const taskDesc = latestTask.description.substring(0, 120);
 
-        const statusCmd = `curl -s -X POST http://localhost:3777/api/employees/${empId}/self/working-status -H "Content-Type: application/json" -d '{"status":"TASK: what you were asked | PROGRESS: done items | CURRENT: what right now | FILES: changed | BLOCKERS: any | STATE: working/stuck/done"}'`;
+        // Use absolute time thresholds for escalation (not nudge count)
+        if (silentMs >= ManagerService.RESTART_AFTER_MS) {
+          // ── Phase 3: Set idle + notify Bruce — 30+ min unresponsive ──
+          // Do NOT auto-restart. Bruce decides when to restart from the HR panel.
+          log('warning', `⏸️ ${emp.avatar} ${emp.name} unresponsive ${silentMin}min — setting idle`);
 
-        if (nudgeCount === 0) {
-          // ── Phase 1: Check-in — evaluate your task and update status ──
-          log('warning', `⏰ ${emp.avatar} ${emp.name} silent ${silentMin}min — activity check`);
+          try {
+            // Kill session if alive
+            if (sessionId) claudeCodeService.cancelSession(sessionId);
 
-          if (sessionId) {
-            claudeCodeService.injectMessage(sessionId,
-              `[ACTIVITY CHECK from Alfred] You've been silent for ${silentMin} minutes.\n` +
-              `Your task: "${taskDesc}"\n\n` +
-              `CHECK NOW and update your working status with FULL DETAIL:\n` +
-              `1. Did you FINISH? → Include "done" and "idle" in your status with a summary of what was completed\n` +
-              `2. Still WORKING? → List what's done (✅), what's pending (⬜), files changed, current action\n` +
-              `3. STUCK? → Describe the exact error/blocker so Alfred can help\n\n` +
-              `  ${statusCmd}`
+            emp.status = 'idle';
+            emp.currentTask = '';
+            emp.activeSessionId = '';
+            emp.lastActivity = new Date();
+            if (latestTask) {
+              latestTask.status = 'failed';
+              latestTask.result = `Session timed out — unresponsive for ${silentMin}min`;
+              latestTask.completedAt = new Date();
+            }
+            await emp.save();
+            wsService.employeeStatusChanged(empId, emp.projectId.toString(), 'idle', emp.name);
+
+            appendDailyLog(
+              `⏸️ ${emp.name} on ${pName} — silent ${silentMin}min, set to idle. Task: "${taskDesc}"${lastWS}`
             );
+
+            telegramService.send(
+              `⏸️ *${emp.name}* on _${pName}_ — unresponsive ${silentMin}min.${lastWS}\n` +
+              `Set to idle. Task was: "${taskDesc}"\nRestart manually from HR if needed.`
+            ).catch(() => {});
+
+            EmployeeLog.create({
+              userId, employeeId: empId, projectId: emp.projectId.toString(),
+              category: 'text', content: `⏸️ Set idle — unresponsive ${silentMin}min. No auto-restart.${lastWS}`,
+              employeeName: emp.name, employeeAvatar: emp.avatar, employeeRole: emp.role, projectName: pName,
+              metadata: { alfredGenerated: true },
+            }).catch(() => {});
+          } catch (err: any) {
+            log('error', `Failed to idle ${emp.name}: ${err.message}`);
           }
 
-          EmployeeLog.create({
-            userId, employeeId: empId, projectId: emp.projectId.toString(),
-            category: 'text', content: `⏰ Activity check: silent ${silentMin}min — asked to evaluate task${lastWS}`,
-            employeeName: emp.name, employeeAvatar: emp.avatar, employeeRole: emp.role, projectName: pName,
-            metadata: { alfredGenerated: true },
-          }).catch(() => {});
+          this.activityNudgeCount.delete(empId);
 
-          this.activityNudgeCount.set(empId, 1);
-
-        } else if (nudgeCount === 1) {
-          // ── Phase 2: Urgent — still no self-evaluation, notify Bruce ──
-          log('warning', `⚠️ ${emp.avatar} ${emp.name} still silent after first check — urgent follow-up`);
+        } else if (silentMs >= ManagerService.WARN_AFTER_MS && (this.activityNudgeCount.get(empId) || 0) < 2) {
+          // ── Phase 2: Urgent warning — 20+ min silent ──
+          log('warning', `⚠️ ${emp.avatar} ${emp.name} silent ${silentMin}min — urgent warning`);
 
           if (sessionId) {
             claudeCodeService.injectMessage(sessionId,
-              `[URGENT from Alfred] You did NOT update your working status after the first check.\n` +
+              `[URGENT from Alfred] No status update for ${silentMin} minutes.\n` +
               `Your task: "${taskDesc}"\n\n` +
-              `You MUST check your work NOW:\n` +
-              `- If the task is DONE: update with "finished" or "idle" in your status\n` +
-              `- If NOT done: describe what's left and keep working\n` +
-              `- If you don't respond, your session will be RESTARTED.\n\n` +
-              `  ${statusCmd}`
+              `You MUST update your working status NOW:\n` +
+              `- If DONE: write "State: done and idle"\n` +
+              `- If WORKING: describe progress\n` +
+              `- If you don't respond within 10 more minutes, your session will be RESTARTED.`
             );
           }
 
           telegramService.send(
-            `⚠️ *${emp.name}* on _${pName}_ — no status update for ${silentMin}min.${lastWS}\n` +
-            `Task: "${taskDesc}"\n` +
-            `Will auto-restart if still silent in 5min.`
+            `⚠️ *${emp.name}* on _${pName}_ — no status for ${silentMin}min.${lastWS}\n` +
+            `Task: "${taskDesc}"\nWill restart if still silent at 30min.`
           ).catch(() => {});
 
           EmployeeLog.create({
             userId, employeeId: empId, projectId: emp.projectId.toString(),
-            category: 'text', content: `⚠️ Second activity check — warned about auto-restart${lastWS}`,
+            category: 'text', content: `⚠️ Urgent: silent ${silentMin}min — warned about restart${lastWS}`,
             employeeName: emp.name, employeeAvatar: emp.avatar, employeeRole: emp.role, projectName: pName,
             metadata: { alfredGenerated: true },
           }).catch(() => {});
 
           this.activityNudgeCount.set(empId, 2);
 
-        } else {
-          // ── Phase 3: Auto-restart — employee is unresponsive, kill session ──
-          log('warning', `🔄 ${emp.avatar} ${emp.name} unresponsive after ${nudgeCount} checks — restarting (no re-task)`);
+        } else if (silentMs >= ManagerService.NUDGE_AFTER_MS && (this.activityNudgeCount.get(empId) || 0) < 1) {
+          // ── Phase 1: First nudge — 10+ min silent ──
+          log('warning', `⏰ ${emp.avatar} ${emp.name} silent ${silentMin}min — nudge`);
 
-          try {
-            await employeeService.restartEmployee(userId, empId);
-
-            appendDailyLog(
-              `🔄 Restarted ${emp.name} on ${pName} — silent ${silentMin}min, no status updates.${lastWS}`
+          if (sessionId) {
+            claudeCodeService.injectMessage(sessionId,
+              `[ACTIVITY CHECK from Alfred] You've been silent for ${silentMin} minutes.\n` +
+              `Your task: "${taskDesc}"\n\n` +
+              `Please update your working status:\n` +
+              `1. FINISHED? → Write "State: done and idle" to .agents/status/${emp.role}.md\n` +
+              `2. Still WORKING? → Write progress with files changed\n` +
+              `3. STUCK? → Describe the blocker`
             );
-
-            telegramService.send(
-              `🔄 Restarted *${emp.name}* on _${pName}_ — unresponsive ${silentMin}min.${lastWS}\n` +
-              `Session killed. Employee is now idle. Task was: "${taskDesc}"`
-            ).catch(() => {});
-
-            EmployeeLog.create({
-              userId, employeeId: empId, projectId: emp.projectId.toString(),
-              category: 'text', content: `🔄 Restarted — unresponsive ${silentMin}min after ${nudgeCount} checks. Session killed, now idle.${lastWS}`,
-              employeeName: emp.name, employeeAvatar: emp.avatar, employeeRole: emp.role, projectName: pName,
-              metadata: { alfredGenerated: true },
-            }).catch(() => {});
-          } catch (err: any) {
-            log('error', `Failed to restart ${emp.name}: ${err.message}`);
-            telegramService.send(`❌ Failed to restart *${emp.name}*: ${err.message}`).catch(() => {});
           }
 
-          this.activityNudgeCount.delete(empId);
+          EmployeeLog.create({
+            userId, employeeId: empId, projectId: emp.projectId.toString(),
+            category: 'text', content: `⏰ Activity nudge: silent ${silentMin}min${lastWS}`,
+            employeeName: emp.name, employeeAvatar: emp.avatar, employeeRole: emp.role, projectName: pName,
+            metadata: { alfredGenerated: true },
+          }).catch(() => {});
+
+          this.activityNudgeCount.set(empId, 1);
         }
       }
 
@@ -2144,7 +2682,7 @@ RULES:
           const context = await this.buildContext(userId, lastMsg.content);
           const msgHistory = history.slice(-MAX_HISTORY).map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }));
           const startTime = Date.now();
-          const response = await this.callAI(context, msgHistory);
+          const response = await this.callAI(context, msgHistory, userId);
           const elapsed = Date.now() - startTime;
           this.lastResponseAt = Date.now();
           persistLog('ai_call', `Watchdog recovery: AI responded in ${(elapsed / 1000).toFixed(1)}s`, { userId, metadata: { durationMs: elapsed } });
@@ -2152,6 +2690,11 @@ RULES:
           const { cleanResponse, actions } = this.parseActions(response);
           const actionResults: string[] = [];
           for (const action of actions) {
+            if (this.isDuplicateAction(action)) {
+              log('warning', `Dedup: skipping duplicate watchdog ${action.action}`);
+              actionResults.push(`⏭️ Skipped duplicate: ${action.action}`);
+              continue;
+            }
             try {
               persistLog('action', `Watchdog executing: ${action.action}`, { userId, metadata: action });
               const result = await this.executeAction(action, userId);
@@ -2436,20 +2979,52 @@ RULES:
           try {
             const context = await this.buildContext(userId, lastMsg.content);
             const msgHistory = history.slice(-MAX_HISTORY).map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }));
-            const response = await this.callAI(context, msgHistory);
+            const READ_ACTIONS_RECOVERY = new Set(['read_employee_status', 'read_employee_status_history', 'read_task_results', 'ask_employee', 'read_direction', 'recall_memory']);
+            let recoveryResponse = await this.callAI(context, msgHistory, userId);
             this.lastResponseAt = Date.now();
-            const { cleanResponse, actions } = this.parseActions(response);
-            const actionResults: string[] = [];
-            for (const action of actions) {
-              try {
-                const result = await this.executeAction(action, userId);
-                actionResults.push(`✅ ${result}`);
-              } catch (err: any) {
-                actionResults.push(`❌ ${err.message}`);
+
+            let recoveryClean = '';
+            const recoveryResults: string[] = [];
+
+            for (let turn = 0; turn <= 3; turn++) {
+              const { cleanResponse, actions } = this.parseActions(recoveryResponse);
+              if (turn === 0) recoveryClean = cleanResponse;
+              else if (cleanResponse) recoveryClean = cleanResponse;
+
+              if (actions.length === 0) break;
+
+              const readResults: string[] = [];
+              for (const action of actions) {
+                if (this.isDuplicateAction(action)) {
+                  log('warning', `Dedup: skipping duplicate recovery ${action.action}`);
+                  recoveryResults.push(`⏭️ Skipped duplicate: ${action.action}`);
+                  continue;
+                }
+                try {
+                  const result = await this.executeAction(action, userId);
+                  recoveryResults.push(`✅ ${result}`);
+                  if (READ_ACTIONS_RECOVERY.has(action.action)) {
+                    readResults.push(`[${action.action}]: ${result}`);
+                  }
+                } catch (err: any) {
+                  recoveryResults.push(`❌ ${err.message}`);
+                }
               }
+
+              if (readResults.length > 0 && turn < 3) {
+                log('info', `Recovery follow-up turn ${turn + 1}: feeding ${readResults.length} read results`);
+                const followUp = `Here are the results:\n\n${readResults.join('\n\n')}\n\nAnalyze and respond to Bruce NOW. Include further actions if needed.`;
+                msgHistory.push({ role: 'assistant', content: recoveryResponse });
+                msgHistory.push({ role: 'user', content: followUp });
+                recoveryResponse = await this.callAI(context, msgHistory, userId);
+                this.lastResponseAt = Date.now();
+                continue;
+              }
+              break;
             }
-            let finalResponse = cleanResponse;
-            if (actionResults.length) finalResponse += '\n\n' + actionResults.join('\n');
+
+            let finalResponse = recoveryClean;
+            if (recoveryResults.length) finalResponse += '\n\n' + recoveryResults.join('\n');
             await this.saveMessage(userId, 'assistant', finalResponse);
             persistLog('message', finalResponse, { direction: 'outbound', userId });
             telegramService.send(finalResponse).catch(() => {});
@@ -2487,16 +3062,56 @@ RULES:
           // Build strategic context from DB (async)
           const strategicCtx = await this.buildStrategicCheckContext(projects, idleEmployees);
 
-          // Compute unread task results across all employees
+          // Compute unread task results + check who needs attention
           const unreadByEmployee: string[] = [];
+          const upToDateEmployees: string[] = [];
+          const needsAttention: string[] = [];
+
           for (const emp of employees) {
-            const unread = emp.taskHistory.filter((t: any) => !t.resultRead && t.result);
-            if (unread.length > 0) {
-              unreadByEmployee.push(`  🔴 ${emp.avatar} ${emp.name}: ${unread.length} unread result(s) — use read_task_results with unread:true, then mark_tasks_read`);
+            // Check unread task results
+            const unreadTasks = emp.taskHistory.filter((t: any) => !t.resultRead && t.result);
+            if (unreadTasks.length > 0) {
+              unreadByEmployee.push(`  🔴 ${emp.avatar} ${emp.name}: ${unreadTasks.length} unread task result(s) — read_task_results unread:true (auto-marks as read)`);
+            }
+
+            // Check unread working status
+            if (emp.workingStatus && !emp.workingStatusRead) {
+              unreadByEmployee.push(`  🔴 ${emp.avatar} ${emp.name}: unread working status — read_employee_status`);
+            }
+
+            // Timestamp check (millisecond precision): has the employee reported since last assignment?
+            const lastAssignedMs = emp.lastAssignedAt ? new Date(emp.lastAssignedAt).getTime() : 0;
+            const statusUpdatedMs = emp.workingStatusAt ? new Date(emp.workingStatusAt).getTime() : 0;
+            const latestTaskResultMs = emp.taskHistory.reduce((max: number, t: any) => {
+              const ms = t.resultUpdatedAt ? new Date(t.resultUpdatedAt).getTime() : 0;
+              return ms > max ? ms : max;
+            }, 0);
+            const latestReportMs = Math.max(statusUpdatedMs, latestTaskResultMs);
+
+            const hasUnread = unreadTasks.length > 0 || (emp.workingStatus && !emp.workingStatusRead);
+
+            if (lastAssignedMs > 0 && latestReportMs > lastAssignedMs && !hasUnread) {
+              // Reported AFTER assignment AND Alfred already read it — fully up to date
+              const agoMin = Math.round((Date.now() - latestReportMs) / 60000);
+              upToDateEmployees.push(`  ✅ ${emp.avatar} ${emp.name}: up to date (reported ${agoMin}min ago, already read)`);
+            } else if (lastAssignedMs > 0 && latestReportMs > lastAssignedMs && hasUnread) {
+              // Reported but Alfred hasn't read yet — just needs reading, not asking
+              upToDateEmployees.push(`  📖 ${emp.avatar} ${emp.name}: reported but unread — read it, don't ask them`);
+            } else if (lastAssignedMs > 0 && latestReportMs <= lastAssignedMs && emp.status === 'working') {
+              // NOT reported since assignment — may need a nudge
+              const sinceMins = Math.round((Date.now() - lastAssignedMs) / 60000);
+              needsAttention.push(`  ⏳ ${emp.avatar} ${emp.name}: assigned ${sinceMins}min ago, no report yet`);
             }
           }
+
           const unreadSection = unreadByEmployee.length > 0
             ? `\nUNREAD TASK RESULTS (read these FIRST):\n${unreadByEmployee.join('\n')}\n`
+            : '';
+          const attentionSection = needsAttention.length > 0
+            ? `\nNEEDS ATTENTION (no report since last assignment):\n${needsAttention.join('\n')}\n`
+            : '';
+          const upToDateSection = upToDateEmployees.length > 0
+            ? `\nUP TO DATE (already reported — do NOT ask them again):\n${upToDateEmployees.join('\n')}\n`
             : '';
 
           // Build a focused prompt for the proactive scan (with memory context)
@@ -2506,33 +3121,91 @@ RULES:
           const pendingTasks = employees.reduce((n: number, e: any) => n + e.taskHistory.filter((t: any) => t.status === 'in_progress').length, 0);
           const failedTasks = employees.reduce((n: number, e: any) => n + e.taskHistory.filter((t: any) => t.status === 'failed' && !t.resultRead).length, 0);
 
-          // Companies without strategic direction
+          // Companies without strategic direction OR with stale direction
           const noDirection = projects.filter(p => !p.onHolding && (!p.strategicDirection || !p.strategicDirection.trim()) && (!p.strategicCycle || p.strategicCycle.status === 'idle'));
           const noDirectionSection = noDirection.length > 0
-            ? `\n⚠️ COMPANIES WITHOUT DIRECTION (${noDirection.length}):\n${noDirection.map(p => `  - ${p.name} (ID: ${p._id}) — no strategic plan. Suggest to Bruce: set to pending_directions.`).join('\n')}\n`
+            ? `\n⚠️ COMPANIES WITHOUT DIRECTION (${noDirection.length}):\n${noDirection.map(p => {
+                const ceo = employees.find(e => e.projectId.toString() === p._id.toString() && e.role === 'ceo');
+                return `  - ${p.name} (ID: ${p._id}) — no strategic plan.${ceo ? ` Has CEO: ${ceo.avatar} ${ceo.name} (${ceo._id}) — ASSIGN them a direction task.` : ' No CEO hired. Suggest to Bruce: hire a CEO or set direction manually.'}`;
+              }).join('\n')}\n`
+            : '';
+
+          // Companies with direction but stale (employees active, direction not updated in 7+ days)
+          const staleDirectionCompanies = projects.filter(p => {
+            if (p.onHolding || !p.strategicDirection) return false;
+            const pEmps = employees.filter(e => e.projectId.toString() === p._id.toString());
+            const hasActivity = pEmps.some(e => e.status === 'working' || (e.workingStatusAt && (now.getTime() - new Date(e.workingStatusAt).getTime()) < 24 * 60 * 60 * 1000));
+            if (!hasActivity) return false;
+            // No cycle active or cycle done — direction might need refresh
+            const cycleStatus = p.strategicCycle?.status || 'idle';
+            return ['idle', 'done'].includes(cycleStatus);
+          });
+          const staleDirectionSection = staleDirectionCompanies.length > 0
+            ? `\n🔄 COMPANIES WITH ACTIVITY BUT NO ACTIVE CYCLE (${staleDirectionCompanies.length}):\n${staleDirectionCompanies.map(p => {
+                const ceo = employees.find(e => e.projectId.toString() === p._id.toString() && e.role === 'ceo');
+                const idleCeo = ceo && ceo.status === 'idle';
+                return `  - ${p.name} (ID: ${p._id}) — employees active but cycle is ${p.strategicCycle?.status || 'idle'}.${idleCeo ? ` CEO ${ceo!.avatar} ${ceo!.name} (${ceo!._id}) is IDLE — assign them to review direction and set new priorities.` : ceo ? ` CEO is working.` : ' No CEO.'}`;
+              }).join('\n')}\n`
             : '';
 
           const scanPrompt = `[PROACTIVE SCAN — this is your loop, NOT a message from Bruce]
 
 You are running your regular patrol. Focus on PENDING WORK — we lose money with unresolved pendencies AND with companies that have no leadership direction.
+REMINDER: You get ONE response. Include ALL your manager-action blocks NOW. Do not say "I'll check" — just include the action. Do NOT use hands_on or read_file to inspect employee work — use read_employee_status and read_task_results instead.
 
 PENDING WORK:
-- Unread task results: ${unreadByEmployee.length > 0 ? unreadByEmployee.length + ' employee(s) with unread results' : 'None'}
+- Unread items: ${unreadByEmployee.length > 0 ? unreadByEmployee.length + ' unread (statuses + task results)' : 'None — all read'}
 - Tasks in progress: ${pendingTasks}
 - Unread failures: ${failedTasks}
-- Companies without direction: ${noDirection.length > 0 ? noDirection.length + ' — these are losing money with no plan' : 'None'}
-${unreadSection}${noDirectionSection}${notifications.length > 0 ? `\nNOTIFICATIONS THIS TICK:\n${notifications.join('\n')}` : ''}
+- Employees needing attention: ${needsAttention.length || 'None'}
+- Companies without direction: ${noDirection.length > 0 ? noDirection.length : 'None'}
+- Companies needing direction refresh: ${staleDirectionCompanies.length || 'None'}
+${unreadSection}${attentionSection}${upToDateSection}${noDirectionSection}${staleDirectionSection}${notifications.length > 0 ? `\nNOTIFICATIONS THIS TICK:\n${notifications.join('\n')}` : ''}
 
-YOUR PRIORITIES (in order):
-1. READ unread task results (read_task_results unread:true) — this is how you learn what was done. Then mark_tasks_read.
-2. ACT on results — assign QA after dev completes, assign dev after QA finds bugs, register applications.
-3. UNBLOCK — if anything is stuck, failed, or waiting, resolve it. Send messages, reassign tasks, escalate to Bruce.
-4. DIRECTION — if any company has no strategic direction and no active cycle, suggest to Bruce: "Bruce, [company] has no direction plan. Shall I set it to pending_directions so leadership can define priorities?"
-5. Only message Bruce about things that need his decision. Don't report routine progress — just handle it.
-6. Write a brief note to your daily log about what you found and what you did.
-7. Keep it SHORT — 2-3 sentences max on Telegram. Bruce is busy.
+YOUR PRIORITIES (follow this order STRICTLY):
 
-AUTONOMOUS LOOP: dev fails/completes → QA tests → bugs found → dev fixes → QA re-tests. You run this loop WITHOUT asking. Just inform Bruce of outcomes.
+STEP 1 — READ WORKING STATUS (your #1 source of truth):
+  For each employee with 🔴 markers above:
+  a. If unread WORKING STATUS → read_employee_status (this auto-marks it as read)
+     The working status is a detailed markdown report written by the employee. It tells you:
+     - What they did (files changed, features built)
+     - What's running (ports, services)
+     - What's blocked (errors, dependencies)
+     - Whether they're done or still working
+     This is ALL you need to make decisions. Do NOT go read their code or log files.
+  b. If unread TASK RESULTS → read_task_results with unread:true (auto-marks as read)
+  Do ALL reads FIRST before any other action. This is how you learn what happened.
+
+STEP 2 — DECIDE (based on working status, NOT code analysis):
+  Based on what you read in their status reports:
+  - Status says "done" / all checkmarks → assign the SAME developer to test it with Playwright (they have built-in QA)
+  - Testing reports bugs → same developer fixes them
+  - Status reports a blocker → use read_employee_status_history to check if it's recurring, then decide: nudge, restart, or escalate
+  - Task failed → read status history to understand the pattern, reassign with clearer instructions
+  - New app mentioned in status → register with add_application
+  - Employee restarted → use read_employee_status_history to give them context on what they were doing before
+  **DO NOT use hands_on, read_file, or list_files to verify employee work. Trust the status reports.**
+
+STEP 3 — ONLY ASK IF NEEDED:
+  Do NOT ask_employee or message_employee unless:
+  - The employee is in "NEEDS ATTENTION" (no report since assignment)
+  - You read their status/results and they are UNCLEAR
+  If an employee is "UP TO DATE" or "reported but unread" → READ first, don't ask.
+
+STEP 4 — DIRECTION (ONLY when Bruce asks):
+  Do NOT proactively assign CEOs to set or review direction. Only do this when Bruce explicitly asks.
+  If Bruce asks about direction, THEN check if a CEO exists and assign them.
+  If no CEO is hired and Bruce asks → suggest: "Company X has no CEO. Hire one or set direction manually."
+
+STEP 5 — LOG & REPORT:
+  Write to daily log. Only message Bruce about decisions that need him.
+  ALWAYS summarize — never dump raw data. Examples:
+  GOOD: "Sarah finished the API, assigned Carlos for QA. Amigo moving forward."
+  BAD: "Sarah's working status says: ## Progress - ✅ Created src/api/... [200 lines of raw status]"
+  If Bruce asks for details, then give a thorough breakdown. Otherwise: short summaries only.
+
+AUTONOMOUS LOOP: developer completes a feature → assign the SAME developer to test it with Playwright (they have built-in QA capabilities). If bugs found → same developer fixes them → re-tests. You run this loop WITHOUT asking. Just inform Bruce of outcomes.
+IMPORTANT: Always assign testing tasks to the SAME developer who built the feature. Do NOT use separate QA testers.
 
 EMPLOYEE SESSION RULES (CRITICAL):
 - Employees stay ALIVE after completing a task. They go to "idle" but their session persists.
@@ -2558,24 +3231,61 @@ ${strategicCtx ? `STRATEGIC ACTION NEEDED:\n${strategicCtx}` : ''}
 
 If everything is genuinely fine and there's nothing actionable, just write to your daily log and say nothing on Telegram.`;
 
-          const proactiveHistory = [{ role: 'user' as const, content: scanPrompt }];
-          const response = await this.callAI(context, proactiveHistory);
+          const READ_ACTIONS_PROACTIVE = new Set(['read_employee_status', 'read_employee_status_history', 'read_task_results', 'ask_employee', 'read_direction', 'recall_memory']);
+          const proactiveHistory: { role: 'user' | 'assistant'; content: string }[] = [{ role: 'user', content: scanPrompt }];
+          let proactiveResponse = await this.callAI(context, proactiveHistory, userId);
           this.lastResponseAt = Date.now();
 
-          const { cleanResponse, actions } = this.parseActions(response);
-          const actionResults: string[] = [];
-          for (const action of actions) {
-            try {
-              const result = await this.executeAction(action, userId);
-              actionResults.push(`✅ ${result}`);
-              appendDailyLog(`⚡ Proactive: ${action.action} → ${result}`);
-            } catch (err: any) {
-              actionResults.push(`❌ ${err.message}`);
+          let finalCleanProactive = '';
+          const allProactiveResults: string[] = [];
+
+          for (let turn = 0; turn <= 3; turn++) {
+            const { cleanResponse, actions } = this.parseActions(proactiveResponse);
+            if (turn === 0) finalCleanProactive = cleanResponse;
+            else if (cleanResponse) finalCleanProactive = cleanResponse;
+
+            if (actions.length === 0) break;
+
+            const readResults: string[] = [];
+            for (const action of actions) {
+              if (this.isDuplicateAction(action)) {
+                log('warning', `Dedup: skipping duplicate proactive ${action.action}`);
+                allProactiveResults.push(`⏭️ Skipped duplicate: ${action.action}`);
+                continue;
+              }
+              try {
+                const result = await this.executeAction(action, userId);
+                allProactiveResults.push(`✅ ${result}`);
+                appendDailyLog(`⚡ Proactive: ${action.action} → ${result.substring(0, 150)}`);
+                if (READ_ACTIONS_PROACTIVE.has(action.action)) {
+                  readResults.push(`[${action.action}]: ${result}`);
+                }
+              } catch (err: any) {
+                allProactiveResults.push(`❌ ${err.message}`);
+              }
             }
+
+            if (readResults.length > 0 && turn < 3) {
+              log('info', `Proactive follow-up turn ${turn + 1}: feeding ${readResults.length} read results`);
+              const followUp = `Here are the results of your actions:\n\n${readResults.join('\n\n')}\n\nAnalyze these and decide what to do next. Include actions NOW. One more turn.`;
+              proactiveHistory.push({ role: 'assistant', content: proactiveResponse });
+              proactiveHistory.push({ role: 'user', content: followUp });
+              proactiveResponse = await this.callAI(context, proactiveHistory, userId);
+              this.lastResponseAt = Date.now();
+              continue;
+            }
+            break;
           }
 
-          let finalResponse = cleanResponse;
-          if (actionResults.length) finalResponse += '\n\n' + actionResults.join('\n');
+          let finalResponse = finalCleanProactive;
+          if (allProactiveResults.length) {
+            if (this.commMode === 'verbose') {
+              finalResponse += '\n\n' + allProactiveResults.join('\n');
+            } else {
+              const actionSummary = allProactiveResults.map(r => r.substring(0, 80)).join('\n');
+              if (actionSummary) finalResponse += '\n\n' + actionSummary;
+            }
+          }
 
           // Only send to Telegram if Alfred actually has something to say
           if (finalResponse.trim() && !finalResponse.toLowerCase().includes('nothing to report')) {

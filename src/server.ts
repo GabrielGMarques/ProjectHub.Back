@@ -111,7 +111,17 @@ async function startServer(): Promise<void> {
       }
 
       if (cmd === '/alfred-status') {
-        return `🤖 *Alfred Status*\nRunning: ${managerService.isRunning() ? '✅' : '❌'}\nLoop: ${managerService.getLoopIntervalDisplay()}`;
+        return `🤖 *Alfred Status*\nRunning: ${managerService.isRunning() ? '✅' : '❌'}\nLoop: ${managerService.getLoopIntervalDisplay()}\nMode: ${managerService.getCommMode().toUpperCase()}`;
+      }
+
+      if (cmd === '/verbose') {
+        managerService.setCommMode('verbose');
+        return `📡 Mode: *VERBOSE* — I'll show you employee statuses, task descriptions, and messages in detail.`;
+      }
+
+      if (cmd === '/chat') {
+        managerService.setCommMode('chat');
+        return `📡 Mode: *CHAT* — I'll only send you my analysis and decisions. No raw employee data.`;
       }
 
       if (cmd === '/delete-alfred-memory') {

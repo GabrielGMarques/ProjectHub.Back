@@ -12,6 +12,11 @@ router.post('/:id/self/status', (req: any, res: any) => controller.selfSetStatus
 router.post('/:id/self/task-done', (req: any, res: any) => controller.selfTaskDone(req, res));
 router.post('/:id/self/task-update', (req: any, res: any) => controller.selfTaskUpdate(req, res));
 router.post('/:id/self/working-status', (req: any, res: any) => controller.selfWorkingStatus(req, res));
+router.get('/:id/self/status-history', (req: any, res: any) => controller.getSelfStatusHistory(req, res));
+router.get('/:id/self/team', (req: any, res: any) => controller.getSelfTeam(req, res));
+router.get('/:id/self/teammate/:teammateId', (req: any, res: any) => controller.getSelfTeammateStatus(req, res));
+router.get('/:id/self/direction', (req: any, res: any) => controller.getSelfDirection(req, res));
+router.post('/:id/self/direction', (req: any, res: any) => controller.setSelfDirection(req, res));
 
 // Everything below requires auth
 router.use(authMiddleware);
@@ -72,6 +77,7 @@ router.post('/:id/task', (req: any, res: any) => controller.assignTask(req, res)
 router.post('/:id/stop', (req: any, res: any) => controller.stopTask(req, res));
 router.post('/:id/message', (req: any, res: any) => controller.sendMessage(req, res));
 router.get('/:id/logs', (req: any, res: any) => controller.getLogs(req, res));
+router.get('/:id/status-history', (req: any, res: any) => controller.getStatusHistory(req, res));
 router.post('/:id/skills', (req: any, res: any) => controller.addSkill(req, res));
 router.delete('/:id/skills/:skillName', (req: any, res: any) => controller.removeSkill(req, res));
 
@@ -82,7 +88,11 @@ router.delete('/:id/memories/:memoryId', (req: any, res: any) => controller.dele
 router.delete('/:id/memories', (req: any, res: any) => controller.wipeMemories(req, res));
 router.post('/:id/compact', (req: any, res: any) => controller.compactLogs(req, res));
 
+// Debug
+router.get('/:id/debug-config', (req: any, res: any) => controller.getDebugConfig(req, res));
+
 // Control
 router.post('/:id/restart', (req: any, res: any) => controller.restartEmployee(req, res));
+router.post('/:id/clear-session', (req: any, res: any) => controller.clearSession(req, res));
 
 export default router;
