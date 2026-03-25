@@ -4,12 +4,22 @@ import crypto from 'crypto';
 import { Project } from '../models/project.model';
 
 export interface ClaudeCodeEvent {
-  type: 'start' | 'text' | 'tool_use' | 'tool_result' | 'error' | 'done' | 'task_idle' | 'token_usage';
+  type: 'start' | 'text' | 'tool_use' | 'tool_result' | 'error' | 'done' | 'task_idle' | 'token_usage' | 'turn_usage';
   content?: string;
   tool?: string;
   sessionId: string;
   timestamp: Date;
   tokenUsage?: TokenUsageData;
+  turnUsage?: TurnUsageData;
+}
+
+export interface TurnUsageData {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  model: string;
+  tools: string[];  // tool names used in this turn
 }
 
 export interface TokenUsageData {
@@ -70,7 +80,7 @@ export class ClaudeCodeService {
     projectPath: string,
     prompt: string,
     onEvent: (event: ClaudeCodeEvent) => void,
-    options?: { resumeSdkSessionId?: string; allowedTools?: string[]; keepAlive?: boolean; mcpServers?: Record<string, any> },
+    options?: { resumeSdkSessionId?: string; allowedTools?: string[]; keepAlive?: boolean; mcpServers?: Record<string, any>; model?: string; shouldContinue?: () => Promise<boolean> },
     timeoutMs: number = DEFAULT_TIMEOUT_MS
   ): Promise<RunCommandResult> {
     // Validate project path — normalize to forward slashes for the SDK
@@ -122,9 +132,10 @@ export class ClaudeCodeService {
     const baseOptions: any = {
       allowedTools: options?.allowedTools?.length ? options.allowedTools : ['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', 'WebSearch'],
       cwd: resolvedPath,
-      maxTurns: 1200,
+      maxTurns: 3000,
       env: sdkEnv,
     };
+    if (options?.model) baseOptions.model = options.model;
 
     // Pass MCP servers directly to the SDK (required for MCP tools to be available)
     if (options?.mcpServers && Object.keys(options.mcpServers).length > 0) {
@@ -134,9 +145,9 @@ export class ClaudeCodeService {
     let currentPrompt = prompt;
     let resumeId = options?.resumeSdkSessionId;
 
+    let lastEventAt = Date.now();
     // Stuck detection: track last event timestamp, inject nudge if silent too long
     const STUCK_CHECK_MS = 5 * 60 * 1000; // 5 minutes
-    let lastEventAt = Date.now();
     const stuckInterval = options?.keepAlive ? setInterval(() => {
       const silentMs = Date.now() - lastEventAt;
       if (silentMs >= STUCK_CHECK_MS && ClaudeCodeService.activeSessions.has(sessionId)) {
@@ -267,37 +278,21 @@ export class ClaudeCodeService {
           continue; // Resume the loop with the new message
         }
 
-        // Keep-alive mode: don't exit, wait for next message
+        // Keep-alive mode: check if employee still has work, otherwise park
         if (options?.keepAlive && sdkSessionId && status === 'completed') {
-          // Check if the employee actually finished or just ran out of turns.
-          // Look at the last few text events — if none mention "done/complete/idle", auto-continue.
-          const recentTexts = collectedEvents
-            .filter(e => e.type === 'text' && e.content)
-            .slice(-3)
-            .map(e => e.content!.toLowerCase());
-          const looksFinished = recentTexts.some(t =>
-            t.includes('task complete') || t.includes('done and idle') || t.includes('all tasks complete') ||
-            t.includes('waiting for next') || t.includes('task is done') || t.includes('finished all')
-          );
+          // Ask the caller if the session should auto-continue (e.g. task result is empty)
+          const shouldContinue = options.shouldContinue ? await options.shouldContinue() : false;
 
-          if (!looksFinished) {
-            // Conversation ended but employee didn't say "done" — hit maxTurns limit
-            console.log(`[ClaudeCode] ⚠️ Session ${sessionId} hit maxTurns (1200) limit — auto-continuing`);
-            const limitEvent: ClaudeCodeEvent = {
-              type: 'error',
-              content: '⚠️ SESSION HIT maxTurns (1200) LIMIT — conversation was stopped by the system, NOT by the employee. Auto-resuming.',
-              sessionId, timestamp: new Date(),
-            };
-            collectedEvents.push(limitEvent);
-            onEvent(limitEvent);
-            currentPrompt = '[SYSTEM] Your conversation was stopped because it hit the 1200-turn limit. Your task is NOT done yet. Continue working from where you left off. Check your working status and keep going. Do NOT start over — pick up exactly where you stopped.';
+          if (shouldContinue) {
+            console.log(`[ClaudeCode] Session ${sessionId} — task result still empty, auto-continuing`);
+            currentPrompt = '[SYSTEM] Your conversation was stopped but your task is NOT done yet — you have not submitted a task result. Continue working from where you left off. Check your working status and keep going. Do NOT start over.';
             resumeId = sdkSessionId;
             continue;
           }
 
-          // Emit task_idle event so the employee service marks the task as done
+          // Task has a result — park and wait for injected messages
           const idleEvent: ClaudeCodeEvent = {
-            type: 'task_idle', content: '💤 Task complete — waiting for next assignment',
+            type: 'task_idle', content: '💤 Task result submitted — waiting for next message',
             sessionId, timestamp: new Date(),
           };
           collectedEvents.push(idleEvent);
@@ -399,7 +394,7 @@ export class ClaudeCodeService {
   async runQuick(
     projectPath: string,
     prompt: string,
-    options?: { allowedTools?: string[]; timeoutMs?: number }
+    options?: { allowedTools?: string[]; timeoutMs?: number; model?: string }
   ): Promise<{ result: string; status: 'completed' | 'failed' | 'cancelled'; events: ClaudeCodeEvent[] }> {
     const timeout = options?.timeoutMs || 3 * 60 * 1000; // 3 min default
     const tools = options?.allowedTools || ['Read', 'Glob', 'Grep', 'Bash'];
@@ -409,7 +404,7 @@ export class ClaudeCodeService {
       projectPath,
       prompt,
       (event) => allEvents.push(event),
-      { allowedTools: tools, keepAlive: false },
+      { allowedTools: tools, keepAlive: false, model: options?.model },
       timeout,
     );
 
@@ -499,10 +494,12 @@ export class ClaudeCodeService {
 
     // Assistant message with content blocks
     if (message.type === 'assistant' && message.message?.content) {
+      const tools: string[] = [];
       for (const block of message.message.content) {
         if (block.type === 'text' && block.text) {
           onEvent({ type: 'text', content: block.text, sessionId, timestamp: new Date() });
         } else if (block.type === 'tool_use') {
+          tools.push(block.name);
           onEvent({
             type: 'tool_use',
             content: JSON.stringify(block.input),
@@ -511,6 +508,25 @@ export class ClaudeCodeService {
             timestamp: new Date(),
           });
         }
+      }
+      // Emit per-turn usage if the API response includes usage data
+      const u = message.message?.usage;
+      if (u && (u.input_tokens || u.output_tokens)) {
+        const turnData: TurnUsageData = {
+          inputTokens: u.input_tokens || 0,
+          outputTokens: u.output_tokens || 0,
+          cacheReadTokens: u.cache_read_input_tokens || 0,
+          cacheCreationTokens: u.cache_creation_input_tokens || 0,
+          model: message.message?.model || 'claude-agent-sdk',
+          tools,
+        };
+        onEvent({
+          type: 'turn_usage',
+          content: `Turn: ${turnData.inputTokens} in / ${turnData.outputTokens} out | tools: ${tools.join(', ') || 'none'}`,
+          sessionId,
+          timestamp: new Date(),
+          turnUsage: turnData,
+        });
       }
       return;
     }

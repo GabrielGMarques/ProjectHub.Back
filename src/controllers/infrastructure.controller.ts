@@ -157,17 +157,62 @@ export class InfrastructureController {
     }
   }
 
-  /** GET /api/projects/:id/applications/:name/screenshots/:filename */
+  /** GET /api/companies/:id/applications/:name/screenshots — list from filesystem */
+  async listScreenshots(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const { id, name } = req.params;
+      const project = await Project.findOne({ _id: id, userId: req.userId });
+      if (!project) { res.status(404).json({ error: 'Company not found' }); return; }
+
+      const cwd = this.getProjectCwd(project);
+      if (!cwd) { res.json([]); return; }
+
+      const appDir = path.join(cwd, '.agents', 'screenshots', name);
+      if (!fs.existsSync(appDir)) { res.json([]); return; }
+
+      const files = fs.readdirSync(appDir)
+        .filter(f => /\.(png|jpg|jpeg|gif|webp)$/i.test(f))
+        .sort(); // alphabetical — filenames often have timestamps
+
+      const screenshots = files.map(f => ({
+        filename: f,
+        originalName: f,
+        caption: f.replace(/\.\w+$/, '').replace(/[-_]/g, ' ').replace(/^\d+\s*/, ''),
+        takenBy: 'developer',
+        takenAt: (() => { try { return fs.statSync(path.join(appDir, f)).mtime.toISOString(); } catch { return new Date().toISOString(); } })(),
+      }));
+      res.json(screenshots);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+
+  /** GET /api/companies/:id/applications/:name/screenshots/:filename — serve from filesystem */
   async getScreenshot(req: AuthRequest, res: Response): Promise<void> {
     const { id, name, filename } = req.params;
-    const safeName = filename.replace(/[/\\..]/g, '');
-    const filePath = path.join(SCREENSHOTS_DIR, id, name, safeName);
+    const safeName = path.basename(filename); // sanitize
 
-    if (!fs.existsSync(filePath)) {
-      res.status(404).json({ error: 'Screenshot not found' });
+    // Try project's .agents/screenshots/ folder first
+    const project = await Project.findOne({ _id: id, userId: req.userId }).lean();
+    if (project) {
+      const cwd = this.getProjectCwd(project);
+      if (cwd) {
+        const fsPath = path.join(cwd, '.agents', 'screenshots', name, safeName);
+        if (fs.existsSync(fsPath)) {
+          res.sendFile(path.resolve(fsPath));
+          return;
+        }
+      }
+    }
+
+    // Fallback to ManagerMemory (legacy collected screenshots)
+    const legacyPath = path.join(SCREENSHOTS_DIR, id, name, safeName);
+    if (fs.existsSync(legacyPath)) {
+      res.sendFile(legacyPath);
       return;
     }
-    res.sendFile(filePath);
+
+    res.status(404).json({ error: 'Screenshot not found' });
   }
 
   /** DELETE /api/projects/:id/applications/:name/screenshots/:filename */
@@ -192,5 +237,11 @@ export class InfrastructureController {
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
+  }
+
+  private getProjectCwd(project: any): string | null {
+    const folders = [...(project.folders || [])];
+    if (project.localPath && !folders.includes(project.localPath)) folders.unshift(project.localPath);
+    return folders[0] || null;
   }
 }

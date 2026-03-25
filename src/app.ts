@@ -14,6 +14,7 @@ import employeeRoutes from './routes/employee.routes';
 import telemetryRoutes from './routes/telemetry.routes';
 import telegramRoutes from './routes/telegram.routes';
 import infrastructureRoutes from './routes/infrastructure.routes';
+import settingsRoutes from './routes/settings.routes';
 
 const app = express();
 
@@ -37,6 +38,7 @@ app.use('/api/employees', employeeRoutes);
 app.use('/api/telemetry', telemetryRoutes);
 app.use('/api/telegram', telegramRoutes);
 app.use('/api/infrastructure', infrastructureRoutes);
+app.use('/api/settings', settingsRoutes);
 
 // Health check
 app.get('/api/health', (_req, res) => {

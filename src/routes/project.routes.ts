@@ -62,6 +62,7 @@ router.put('/:id/applications/:name', (req: any, res: any) => infraController.up
 router.delete('/:id/applications/:name', (req: any, res: any) => infraController.removeApplication(req, res));
 
 // Application screenshots
+router.get('/:id/applications/:name/screenshots', (req: any, res: any) => infraController.listScreenshots(req, res));
 router.post('/:id/applications/:name/screenshots', upload.single('file'), (req: any, res: any) => infraController.uploadScreenshot(req, res));
 router.get('/:id/applications/:name/screenshots/:filename', (req: any, res: any) => infraController.getScreenshot(req, res));
 router.delete('/:id/applications/:name/screenshots/:filename', (req: any, res: any) => infraController.deleteScreenshot(req, res));

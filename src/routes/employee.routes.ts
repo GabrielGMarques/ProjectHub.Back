@@ -21,6 +21,7 @@ router.get('/:id/self/applications', (req: any, res: any) => controller.getSelfA
 router.post('/:id/self/applications', (req: any, res: any) => controller.selfUpsertApplication(req, res));
 router.post('/:id/self/applications/:appName/screenshots', (req: any, res: any) => controller.selfUploadScreenshot(req, res));
 router.post('/:id/self/inbox', (req: any, res: any) => controller.selfSendInbox(req, res));
+router.post('/:id/self/escalate', (req: any, res: any) => controller.selfEscalate(req, res));
 
 // Catch-all for unknown /self/* routes — return 404 instead of falling through to auth
 router.all('/:id/self/*', (req: any, res: any) => {
@@ -32,6 +33,7 @@ router.all('/:id/self/*', (req: any, res: any) => {
       'GET /self/teammate/:id', 'GET /self/direction', 'POST /self/direction',
       'GET /self/applications', 'POST /self/applications',
       'POST /self/applications/:appName/screenshots', 'POST /self/inbox',
+      'POST /self/escalate',
     ],
   });
 });

@@ -19,6 +19,7 @@ import { wsService } from './websocket.service';
 import { infrastructureService } from './infrastructure.service';
 import { WorkingStatusHistory } from '../models/working-status-history.model';
 import { DirectionHistory } from '../models/direction-history.model';
+import { modelRoutingService } from './model-routing.service';
 
 const telegramService = telegramBot;
 const employeeService = new EmployeeService();
@@ -60,7 +61,13 @@ export interface ManagerLogEntry {
 
 const managerLog: ManagerLogEntry[] = [];
 const MAX_LOG = 200;
-const MAX_HISTORY = 20;
+const MAX_HISTORY = 10;
+
+/** Timestamped console log for Alfred debugging */
+function alfredLog(msg: string): void {
+  const ts = new Date().toISOString().replace('T', ' ').substring(0, 19);
+  console.log(`[${ts}] [Alfred] ${msg}`);
+}
 
 // In-memory log (fast, for /manager/log endpoint) + WebSocket broadcast
 function log(type: ManagerLogEntry['type'], message: string): void {
@@ -95,6 +102,7 @@ export class ManagerService {
   private running = false;
   private commMode: 'chat' | 'verbose' = 'chat';    // chat = only Alfred's analysis, verbose = include employee data
   private loopIntervalMs = 3 * 60 * 60 * 1000;     // main scan loop (default 3h)
+  private unansweredCheckMs = 3 * 60 * 1000;        // unanswered message recovery threshold (default 3min)
   private readonly ACTIVITY_CHECK_MS = 5 * 60 * 1000; // 5-min fast employee activity check
   // Escalation thresholds — absolute time since last sign of life
   private static readonly NUDGE_AFTER_MS = 10 * 60 * 1000;    // 10 min → first nudge
@@ -310,7 +318,8 @@ YOUR JOB RIGHT NOW:
 Be Alfred. Be sharp. Hit the ground running.`;
 
     try {
-      const response = await this.callAI(context, [{ role: 'user', content: wakeUpPrompt }], userId);
+      const wakeModel = await modelRoutingService.resolveModel(userId, { action: 'alfred_wakeup', source: 'alfred' });
+      const response = await this.callAI(context, [{ role: 'user', content: wakeUpPrompt }], userId, wakeModel);
       this.lastResponseAt = Date.now();
 
       const { cleanResponse, actions } = this.parseActions(response);
@@ -487,21 +496,30 @@ Be Alfred. Be sharp. Hit the ground running.`;
     }
 
     // Build full system context (with long-term memory retrieval using user's message)
+    alfredLog(`handleMessage: Bruce says: "${text.substring(0, 10)}..." — building context...`);
+    const ctxStart = Date.now();
     const context = await this.buildContext(userId, text);
+    alfredLog(`handleMessage: context built in ${Date.now() - ctxStart}ms (${context.length} chars)`);
 
     // Load persisted conversation history + append new message
     const history = await this.loadHistory(userId);
     history.push({ role: 'user', content: text });
+    const historyChars = history.reduce((s, m) => s + m.content.length, 0);
+    alfredLog(`handleMessage: ${history.length} history messages (${historyChars} chars)`);
 
     // Save user message to DB immediately
     await this.saveMessage(userId, 'user', text);
 
     try {
       const startTime = Date.now();
-      persistLog('ai_call', 'Calling Claude Agent SDK', { userId, metadata: { promptLength: context.length, historyLength: history.length } });
-      const response = await this.callAI(context, history, userId);
+      const msgModel = await modelRoutingService.resolveModel(userId, { action: 'alfred_message', source: 'alfred' });
+      const totalChars = context.length + historyChars;
+      alfredLog(`handleMessage: calling AI (model: ${msgModel}, total context: ${totalChars} chars, ~${Math.round(totalChars / 4)}tokens)`);
+      persistLog('ai_call', `Calling Claude Agent SDK (model: ${msgModel})`, { userId, metadata: { promptLength: context.length, historyChars, historyLength: history.length, model: msgModel } });
+      const response = await this.callAI(context, history, userId, msgModel);
       const elapsed = Date.now() - startTime;
       this.lastResponseAt = Date.now();
+      alfredLog(`handleMessage: Alfred says: "${response.substring(0, 10)}..." — ${(elapsed / 1000).toFixed(1)}s (${response.length} chars)`);
       log('info', `AI responded in ${(elapsed / 1000).toFixed(1)}s`);
       persistLog('ai_call', `AI responded in ${(elapsed / 1000).toFixed(1)}s`, { userId, metadata: { durationMs: elapsed, responseLength: response.length } });
 
@@ -515,33 +533,42 @@ Be Alfred. Be sharp. Hit the ground running.`;
       for (let turn = 0; turn <= MAX_FOLLOW_UPS; turn++) {
         const { cleanResponse, actions } = this.parseActions(currentResponse);
         if (turn === 0) finalClean = cleanResponse;
-        else if (cleanResponse) finalClean = cleanResponse; // later turns override with the actual analysis
+        else if (cleanResponse) finalClean = cleanResponse;
 
-        if (actions.length === 0) break;
+        alfredLog(`handleMessage: turn ${turn}, ${actions.length} actions parsed, cleanResponse=${cleanResponse.length} chars`);
+
+        if (actions.length === 0) {
+          alfredLog(`handleMessage: no actions — done with follow-up loop`);
+          break;
+        }
 
         const actionResults: string[] = [];
         const readResults: string[] = [];
 
         for (const action of actions) {
           if (this.isDuplicateAction(action)) {
+            alfredLog(`handleMessage: dedup skipped ${action.action}`);
             log('warning', `Dedup: skipping duplicate ${action.action}`);
             actionResults.push(`⏭️ Skipped duplicate: ${action.action}`);
             allActionResults.push(`⏭️ Skipped duplicate: ${action.action}`);
             continue;
           }
           try {
+            alfredLog(`handleMessage: executing action ${action.action}...`);
+            const actionStart = Date.now();
             persistLog('action', `Executing: ${action.action}`, { userId, metadata: action });
             const result = await this.executeAction(action, userId);
+            alfredLog(`handleMessage: action ${action.action} completed in ${((Date.now() - actionStart) / 1000).toFixed(1)}s`);
             actionResults.push(`✅ ${result}`);
             allActionResults.push(`✅ ${result}`);
             log('action', result.substring(0, 150));
             persistLog('action', `✅ ${result.substring(0, 300)}`, { userId });
             appendDailyLog(`⚡ Action: ${action.action} → ${result.substring(0, 150)}`);
-            // Track read results for follow-up
             if (READ_ACTIONS.has(action.action)) {
               readResults.push(`[${action.action}]: ${result}`);
             }
           } catch (err: any) {
+            alfredLog(`handleMessage: action ${action.action} FAILED: ${err.message}`);
             actionResults.push(`❌ ${err.message}`);
             allActionResults.push(`❌ ${err.message}`);
             log('error', `Action failed: ${err.message}`);
@@ -552,16 +579,19 @@ Be Alfred. Be sharp. Hit the ground running.`;
 
         // If there were read actions, feed results back to Alfred for analysis
         if (readResults.length > 0 && turn < MAX_FOLLOW_UPS) {
-          log('info', `Follow-up turn ${turn + 1}: feeding ${readResults.length} read results back to Alfred`);
+          alfredLog(`handleMessage: follow-up turn ${turn + 1} — feeding ${readResults.length} read results (${readResults.join('').length} chars) back to AI...`);
           const followUpMsg = `Here are the results of your actions:\n\n${readResults.join('\n\n')}\n\nNow analyze these results and respond to Bruce. Include any further actions needed. Remember: you get ONE more turn — act NOW, don't promise.`;
           history.push({ role: 'assistant', content: currentResponse });
           history.push({ role: 'user', content: followUpMsg });
-          currentResponse = await this.callAI(context, history, userId);
+          const followUpStart = Date.now();
+          currentResponse = await this.callAI(context, history, userId, msgModel);
+          alfredLog(`handleMessage: follow-up Alfred says: "${currentResponse.substring(0, 10)}..." — ${((Date.now() - followUpStart) / 1000).toFixed(1)}s (${currentResponse.length} chars)`);
           this.lastResponseAt = Date.now();
           continue;
         }
 
-        break; // No reads or max turns reached
+        alfredLog(`handleMessage: no read actions or max turns — exiting loop`);
+        break;
       }
 
       let finalResponse = finalClean;
@@ -587,9 +617,11 @@ Be Alfred. Be sharp. Hit the ground running.`;
         );
       }
 
+      alfredLog(`handleMessage: DONE — returning "${finalResponse.substring(0, 10)}..." (${finalResponse.length} chars) to Telegram`);
       return finalResponse;
     } catch (err: any) {
       const errMsg = err.message || 'Unknown error';
+      alfredLog(`ERROR:handleMessage FAILED: ${errMsg}`);
       log('error', `AI failed: ${errMsg}`);
       persistLog('error', `AI call failed: ${errMsg}`, { userId, metadata: { stack: err.stack?.substring(0, 500) } });
 
@@ -719,6 +751,7 @@ Be Alfred. Be sharp. Hit the ground running.`;
     ctx += `  Watchdog: ×${this.watchdogFactor} = ${Math.round(this.watchdogIntervalMs / 60000)}min\n`;
     ctx += `  Stuck nudge: ×${this.stuckNudgeFactor} = ${Math.round(this.stuckNudgeMs / 60000)}min\n`;
     ctx += `  Stuck restart: ×${this.stuckRestartFactor} = ${Math.round(this.stuckRestartMs / 60000)}min\n`;
+    ctx += `  Unanswered msg check: ${Math.round(this.unansweredCheckMs / 60000)}min (Haiku fallback if main model fails)\n`;
     ctx += `  Change loop with adjust_timers. Other timers scale automatically.\n\n`;
 
     ctx += `COMMUNICATION MODE: ${this.commMode.toUpperCase()}\n`;
@@ -780,21 +813,16 @@ Be Alfred. Be sharp. Hit the ground running.`;
       for (const e of pEmps) {
         ctx += `    ${e.avatar} ${e.name} (${e.title}) — ${e.status}`;
         if (e.currentTask) ctx += ` [working]`;
-        ctx += ` | ID: ${e._id}\n`;
-
-        // Working status — full text so Alfred can answer questions without extra calls
+        ctx += ` | ID: ${e._id}`;
+        // One-line status summary (NOT the full working status — use read_employee_status for details)
         if (e.workingStatus) {
-          const wsAge = e.workingStatusAt ? `${Math.round((now.getTime() - new Date(e.workingStatusAt).getTime()) / 60000)}min ago` : '';
-          const wsRead = e.workingStatusRead ? 'read' : 'UNREAD';
-          ctx += `      📋 Working Status (${wsAge}, ${wsRead}): ${e.workingStatus.substring(0, 800)}\n`;
+          const wsAge = e.workingStatusAt ? Math.round((now.getTime() - new Date(e.workingStatusAt).getTime()) / 60000) : 0;
+          const wsRead = e.workingStatusRead ? '' : ' UNREAD';
+          // Extract first meaningful line from working status
+          const firstLine = e.workingStatus.replace(/^#+\s*/gm, '').split('\n').find(l => l.trim().length > 10)?.trim() || '';
+          ctx += ` | ${wsAge}min ago${wsRead}: ${firstLine.substring(0, 120)}`;
         }
-
-        // Last task result — so Alfred knows what was done
-        const lastDone = [...e.taskHistory].reverse().find((t: any) => t.result);
-        if (lastDone) {
-          const tRead = (lastDone as any).resultRead ? 'read' : 'UNREAD';
-          ctx += `      📝 Last task (${tRead}): "${(lastDone as any).description?.substring(0, 80)}" → ${(lastDone as any).result?.substring(0, 400)}\n`;
-        }
+        ctx += `\n`;
       }
     }
 
@@ -803,6 +831,21 @@ Be Alfred. Be sharp. Hit the ground running.`;
       for (const p of holdingProjects) {
         ctx += `  ⏸️ ${p.name} (ID: ${p._id}) — $${p.mrr || 0} MRR\n`;
       }
+    }
+
+    // Recent pulse — latest 5 working status updates across all employees (grouped by employee)
+    const recentStatuses = await WorkingStatusHistory.find({ userId })
+      .sort({ createdAt: -1 })
+      .limit(5)
+      .lean();
+    if (recentStatuses.length > 0) {
+      ctx += `\n=== 📊 RECENT PULSE (latest status updates — use read_employee_status for full details) ===\n`;
+      for (const s of recentStatuses) {
+        const age = Math.round((now.getTime() - new Date(s.createdAt).getTime()) / 60000);
+        const summary = s.content.replace(/^#+\s*/gm, '').split('\n').filter((l: string) => l.trim().length > 5).slice(0, 3).join(' | ').substring(0, 200);
+        ctx += `  ${s.employeeName} (${s.employeeRole}, ${age}min ago): ${summary}\n`;
+      }
+      ctx += `  → Use read_employee_status or read_employee_status_history for full details.\n`;
     }
 
     // Employee inbox messages (unread)
@@ -971,9 +1014,9 @@ Force-set a cycle to: "idle", "active", "dev", "qa", "done". Force-set to any st
 Clear an employee's cached session (sdkSessionId, activeSessionId). Use when an employee is stuck with permission errors. After clearing, the next task assignment creates a fresh session.
 
 \`\`\`manager-action
-{"action": "adjust_timers", "loop": 180, "watchdogFactor": 2, "stuckNudgeFactor": 1, "stuckRestartFactor": 2}
+{"action": "adjust_timers", "loop": 180, "watchdogFactor": 2, "stuckNudgeFactor": 1, "stuckRestartFactor": 2, "unansweredCheckMin": 3}
 \`\`\`
-loop = minutes. Other timers are FACTORS of the loop (×1, ×2, ×3...). Only include what you want to change.
+loop = minutes. Other timers are FACTORS of the loop (×1, ×2, ×3...). unansweredCheckMin = minutes before retrying unanswered messages with Haiku fallback. Only include what you want to change.
 
 \`\`\`manager-action
 {"action": "set_comm_mode", "mode": "chat"}
@@ -1154,16 +1197,18 @@ RULES:
 
   private static tokenUsageService = new TokenUsageService();
 
-  private async callAI(systemPrompt: string, messages: { role: 'user' | 'assistant'; content: string }[], userId?: string): Promise<string> {
-    // 90s timeout for manager responses — keeps Telegram responsive
-    // Use Sonnet for Alfred — faster and cheaper than Opus
+  private async callAI(systemPrompt: string, messages: { role: 'user' | 'assistant'; content: string }[], userId?: string, modelOverride?: string): Promise<string> {
+    const model = modelOverride || 'sonnet';
+    const aiStart = Date.now();
+    alfredLog(`callAI: model=${model}, system=${systemPrompt.length} chars, messages=${messages.length}, timeout=120s`);
     const result = await claudeChat({
       system: systemPrompt,
       messages: messages.map(m => ({ role: m.role, content: m.content })),
       timeoutMs: 120_000,
       retries: 3,
-      model: 'sonnet',
+      model,
     });
+    alfredLog(`callAI: completed in ${((Date.now() - aiStart) / 1000).toFixed(1)}s, response=${result.length} chars`);
 
     // Record token usage from this call
     const usage = getLastUsage();
@@ -1771,6 +1816,11 @@ RULES:
         if (action.stuckRestartFactor != null) {
           this.stuckRestartFactor = Math.max(1, Number(action.stuckRestartFactor));
           changes.push(`Stuck restart → ×${this.stuckRestartFactor} (${Math.round(this.stuckRestartMs / 60000)}min)`);
+        }
+        if (action.unansweredCheckMin != null) {
+          const mins = Math.max(1, Number(action.unansweredCheckMin));
+          this.unansweredCheckMs = mins * 60 * 1000;
+          changes.push(`Unanswered msg check → ${mins}min`);
         }
         if (!changes.length) throw new Error('No values provided');
         this.restart();
@@ -2718,11 +2768,12 @@ RULES:
         telegramService.send(`🔄 _Sorry Bruce — I got hung up on your last message. Picking it back up now._`).catch(() => {});
 
         try {
-          persistLog('ai_call', 'Watchdog recovery: calling AI', { userId });
+          const watchdogModel = await modelRoutingService.resolveModel(userId, { action: 'alfred_watchdog', source: 'alfred' });
+          persistLog('ai_call', `Watchdog recovery: calling AI (model: ${watchdogModel})`, { userId });
           const context = await this.buildContext(userId, lastMsg.content);
           const msgHistory = history.slice(-MAX_HISTORY).map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }));
           const startTime = Date.now();
-          const response = await this.callAI(context, msgHistory, userId);
+          const response = await this.callAI(context, msgHistory, userId, watchdogModel);
           const elapsed = Date.now() - startTime;
           this.lastResponseAt = Date.now();
           persistLog('ai_call', `Watchdog recovery: AI responded in ${(elapsed / 1000).toFixed(1)}s`, { userId, metadata: { durationMs: elapsed } });
@@ -3006,21 +3057,21 @@ RULES:
         );
       }
 
-      // ── 6. Check for unanswered user messages (pick up where we left off) ──
+      // ── 6. Check for unanswered user messages — model configurable via action route ──
       const history = user.managerChatMessages || [];
       const lastMsg = history[history.length - 1];
       if (lastMsg && lastMsg.role === 'user') {
         const ageMs = now.getTime() - new Date(lastMsg.timestamp).getTime();
-        // If unanswered for > 3 min, recover (uses AI tokens — but necessary)
-        if (ageMs > 3 * 60 * 1000) {
-          log('warning', `Loop: unanswered message (${(ageMs / 60000).toFixed(0)}min) — recovering`);
-          persistLog('loop', `Picking up unanswered demand: "${lastMsg.content.substring(0, 80)}"`, { userId });
+        if (ageMs > this.unansweredCheckMs) {
+          const unansweredModel = await modelRoutingService.resolveModel(userId, { action: 'unanswered_recovery', source: 'alfred' });
+          log('warning', `Loop: unanswered message (${(ageMs / 60000).toFixed(0)}min) — recovering with ${unansweredModel}`);
+          persistLog('loop', `Picking up unanswered demand (${unansweredModel}): "${lastMsg.content.substring(0, 80)}"`, { userId });
           telegramService.send(`🔄 _Picking up where I left off, Bruce..._`).catch(() => {});
           try {
             const context = await this.buildContext(userId, lastMsg.content);
             const msgHistory = history.slice(-MAX_HISTORY).map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }));
             const READ_ACTIONS_RECOVERY = new Set(['read_employee_status', 'read_employee_status_history', 'read_task_results', 'ask_employee', 'read_direction', 'recall_memory']);
-            let recoveryResponse = await this.callAI(context, msgHistory, userId);
+            let recoveryResponse = await this.callAI(context, msgHistory, userId, unansweredModel);
             this.lastResponseAt = Date.now();
 
             let recoveryClean = '';
@@ -3056,7 +3107,7 @@ RULES:
                 const followUp = `Here are the results:\n\n${readResults.join('\n\n')}\n\nAnalyze and respond to Bruce NOW. Include further actions if needed.`;
                 msgHistory.push({ role: 'assistant', content: recoveryResponse });
                 msgHistory.push({ role: 'user', content: followUp });
-                recoveryResponse = await this.callAI(context, msgHistory, userId);
+                recoveryResponse = await this.callAI(context, msgHistory, userId, unansweredModel);
                 this.lastResponseAt = Date.now();
                 continue;
               }
@@ -3065,13 +3116,13 @@ RULES:
 
             let finalResponse = recoveryClean;
             if (recoveryResults.length) finalResponse += '\n\n' + recoveryResults.join('\n');
-            await this.saveMessage(userId, 'assistant', finalResponse);
-            persistLog('message', finalResponse, { direction: 'outbound', userId });
+            await this.saveMessage(userId, 'assistant', finalResponse.substring(0, 1200));
+            persistLog('message', finalResponse.substring(0, 1200), { direction: 'outbound', userId });
             telegramService.send(finalResponse).catch(() => {});
-            log('info', 'Loop: recovered unanswered demand');
+            log('info', `Loop: recovered unanswered demand with ${unansweredModel}`);
           } catch (err: any) {
-            log('error', `Loop recovery failed: ${err.message}`);
-            persistLog('error', `Loop recovery failed: ${err.message}`, { userId });
+            log('error', `Loop Haiku recovery failed: ${err.message}`);
+            persistLog('error', `Loop Haiku recovery failed: ${err.message}`, { userId });
           }
         }
       }
@@ -3275,9 +3326,10 @@ ${strategicCtx ? `STRATEGIC ACTION NEEDED:\n${strategicCtx}` : ''}
 
 If everything is genuinely fine and there's nothing actionable, just write to your daily log and say nothing on Telegram.`;
 
+          const scanModel = await modelRoutingService.resolveModel(userId, { action: 'proactive_scan', source: 'alfred' });
           const READ_ACTIONS_PROACTIVE = new Set(['read_employee_status', 'read_employee_status_history', 'read_task_results', 'ask_employee', 'read_direction', 'recall_memory']);
           const proactiveHistory: { role: 'user' | 'assistant'; content: string }[] = [{ role: 'user', content: scanPrompt }];
-          let proactiveResponse = await this.callAI(context, proactiveHistory, userId);
+          let proactiveResponse = await this.callAI(context, proactiveHistory, userId, scanModel);
           this.lastResponseAt = Date.now();
 
           let finalCleanProactive = '';
@@ -3314,7 +3366,7 @@ If everything is genuinely fine and there's nothing actionable, just write to yo
               const followUp = `Here are the results of your actions:\n\n${readResults.join('\n\n')}\n\nAnalyze these and decide what to do next. Include actions NOW. One more turn.`;
               proactiveHistory.push({ role: 'assistant', content: proactiveResponse });
               proactiveHistory.push({ role: 'user', content: followUp });
-              proactiveResponse = await this.callAI(context, proactiveHistory, userId);
+              proactiveResponse = await this.callAI(context, proactiveHistory, userId, scanModel);
               this.lastResponseAt = Date.now();
               continue;
             }

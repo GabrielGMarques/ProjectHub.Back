@@ -280,6 +280,8 @@ export class TelegramService {
         if (fromChatId !== this.chatId) continue;
 
         // Queue the message for non-blocking processing
+        const ts = new Date().toISOString().replace('T', ' ').substring(0, 19);
+        console.log(`[${ts}] [Telegram] Queued: "${text.substring(0, 30)}..." (queue size: ${this.messageQueue.length + 1}, processing: ${this.processing})`);
         this.messageQueue.push({ text, chatId: fromChatId });
       }
 
@@ -289,7 +291,13 @@ export class TelegramService {
   }
 
   private async processQueue(): Promise<void> {
-    if (this.processing || this.messageQueue.length === 0) return;
+    if (this.processing || this.messageQueue.length === 0) {
+      if (this.messageQueue.length > 0) {
+        const ts = new Date().toISOString().replace('T', ' ').substring(0, 19);
+        console.log(`[${ts}] [Telegram] Queue blocked — still processing previous message (${this.messageQueue.length} waiting)`);
+      }
+      return;
+    }
     this.processing = true;
 
     while (this.messageQueue.length > 0) {

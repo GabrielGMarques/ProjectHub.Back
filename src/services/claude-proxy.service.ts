@@ -60,7 +60,7 @@ export async function claudeChat(opts: ProxyOptions & { timeoutMs?: number; retr
       // Exponential backoff: 2s, 4s
       const delay = Math.min(2000 * Math.pow(2, attempt - 1), 8000);
       await new Promise(r => setTimeout(r, delay));
-      console.log(`[ClaudeProxy] Retry attempt ${attempt}/${maxRetries}`);
+      console.log(`[${new Date().toISOString().replace('T', ' ').substring(0, 19)}] [ClaudeProxy] Retry attempt ${attempt}/${maxRetries}`);
     }
 
     try {
@@ -75,7 +75,7 @@ export async function claudeChat(opts: ProxyOptions & { timeoutMs?: number; retr
       lastError = new Error('Empty response from Claude');
     } catch (err: any) {
       lastError = err;
-      console.log(`[ClaudeProxy] Attempt ${attempt + 1} failed: ${err.message}`);
+      console.log(`[${new Date().toISOString().replace('T', ' ').substring(0, 19)}] [ClaudeProxy] Attempt ${attempt + 1} failed: ${err.message}`);
 
       // Don't retry on auth errors
       if (err.message?.includes('auth') || err.message?.includes('permission')) {
@@ -84,7 +84,7 @@ export async function claudeChat(opts: ProxyOptions & { timeoutMs?: number; retr
     }
   }
 
-  console.error(`[ClaudeProxy] All ${maxRetries + 1} attempts failed. Last error: ${lastError?.message}`);
+  console.error(`[${new Date().toISOString().replace('T', ' ').substring(0, 19)}] [ClaudeProxy] All ${maxRetries + 1} attempts failed. Last error: ${lastError?.message}`);
   throw lastError || new Error('Claude chat failed after retries');
 }
 
@@ -115,6 +115,8 @@ async function doQuery(opts: ProxyOptions): Promise<string> {
   }
 
   const prompt = parts.join('\n\n');
+  console.log(`[${new Date().toISOString().replace('T', ' ').substring(0, 19)}] [ClaudeProxy] doQuery: model=${opts.model || 'default'}, prompt=${prompt.length} chars (~${Math.round(prompt.length / 4)} tokens)`);
+  const queryStart = Date.now();
 
   // Strip ANTHROPIC_API_KEY so the SDK uses OAuth
   const sdkEnv: Record<string, string | undefined> = { ...process.env };
@@ -160,6 +162,7 @@ async function doQuery(opts: ProxyOptions): Promise<string> {
     }
   }
 
+  console.log(`[${new Date().toISOString().replace('T', ' ').substring(0, 19)}] [ClaudeProxy] doQuery: completed in ${((Date.now() - queryStart) / 1000).toFixed(1)}s, result=${result.length} chars${_lastUsage ? `, ${_lastUsage.inputTokens} in / ${_lastUsage.outputTokens} out` : ''}`);
   return result;
 }
 

@@ -12,6 +12,7 @@ import { employeeMemoryService } from './employee-memory.service';
 import { wsService } from './websocket.service';
 import { TokenUsageService } from './token-usage.service';
 import { WorkingStatusHistory } from '../models/working-status-history.model';
+import { modelRoutingService } from './model-routing.service';
 
 const claudeCodeService = new ClaudeCodeService();
 const telegramService = telegramBot;
@@ -162,6 +163,16 @@ export class EmployeeService {
 
   getRoleTemplates(): RoleTemplate[] {
     return ROLE_TEMPLATES;
+  }
+
+  /** Classify a task string into an action type for model routing */
+  private classifyTaskAction(task: string, role: string): string {
+    const lower = task.toLowerCase();
+    if (lower.includes('[restart') || lower.includes('self-evaluation') || lower.includes('self evaluation')) return 'self_eval';
+    if (lower.includes('[message from alfred') || lower.includes('[question from alfred')) return 'answer_question';
+    if (role === 'ceo' && (lower.includes('direction') || lower.includes('strategy') || lower.includes('strategic'))) return 'ceo_direction';
+    if (lower.includes('test') || lower.includes('playwright') || lower.includes('qa') || lower.includes('verify')) return 'test_task';
+    return 'dev_task';
   }
 
   async hire(userId: string, projectId: string, role: string, customName?: string): Promise<IEmployee> {
@@ -469,7 +480,7 @@ export class EmployeeService {
       ? `\nCOMPANY STRATEGIC DIRECTION (set by leadership — align your work with this):\n${project.strategicDirection.substring(0, 3000)}\n`
       : '';
 
-    const prompt = `${employee.systemPrompt}
+    let prompt = `${employee.systemPrompt}
 
 PROJECT: ${project.name}
 ${project.description ? `DESCRIPTION: ${project.description}` : ''}
@@ -565,6 +576,40 @@ NEVER loop on the same failing action. This wastes time and resources. Adapt or 
 TEAM MEMBERS:
 ${teamList}
 
+═══════════════════════════════════════════════════════════════════
+FIRST THING TO DO — RECALL YOUR MEMORY (DO THIS BEFORE ANY WORK):
+═══════════════════════════════════════════════════════════════════
+Before writing a single line of code, you MUST recall what happened before. Run these commands:
+
+1. GET YOUR PROFILE + CURRENT TASK + ASSIGNED MEMORIES:
+   curl -s http://localhost:3777/api/employees/${employee._id}
+   → Returns your role, current task, working status, and memory entries.
+
+2. GET YOUR WORKING STATUS HISTORY (what you did in previous sessions):
+   curl -s http://localhost:3777/api/employees/${employee._id}/self/status-history?limit=5
+   → Returns your last 5 status updates with timestamps. This is your "session memory".
+   → Read this carefully to understand WHERE YOU LEFT OFF and what progress was already made.
+
+3. GET COMPANY DIRECTION (strategic context):
+   curl -s http://localhost:3777/api/employees/${employee._id}/self/direction
+   → Returns the company's strategic direction. Align your work with this.
+
+4. GET TEAM STATUS (what teammates are doing):
+   curl -s http://localhost:3777/api/employees/${employee._id}/self/team
+   → Lists all employees and their current status. Check for dependencies/blockers.
+
+5. LIST APPLICATIONS (existing apps, ports, services):
+   curl -s http://localhost:3777/api/employees/${employee._id}/self/applications
+   → Returns registered apps and used ports. ALWAYS check before choosing a port.
+
+DO NOT SKIP THIS STEP. Every time you start a task, you are in a FRESH session with NO memory
+of previous work. These API calls ARE your memory. Without them you will redo work, create
+duplicates, and waste time. The status history is the single most important thing to read.
+
+If you feel lost or confused at ANY point during your work, re-read your status history:
+  curl -s http://localhost:3777/api/employees/${employee._id}/self/status-history?limit=5
+═══════════════════════════════════════════════════════════════════
+
 COMMUNICATION PRIORITY ORDER:
 Your #1 job after ANY progress is to UPDATE YOUR WORKING STATUS. Everything else is secondary.
 
@@ -591,25 +636,7 @@ HOW TO UPDATE (2-step process to avoid permission issues):
   Step 2: Send it with curl:
     curl -s -X POST http://localhost:3777/api/employees/${employee._id}/self/working-status -H "Content-Type: application/json" -d @${normCwd}/.agents/status/${employee.role}.json
 
-  READ YOUR CURRENT STATUS AND TASKS:
-    curl -s http://localhost:3777/api/employees/${employee._id}
-
-  READ YOUR WORKING STATUS HISTORY (to remember what you did before):
-    curl -s http://localhost:3777/api/employees/${employee._id}/self/status-history?limit=5
-    This returns your previous status updates. Use it when you're restarted or unsure what you were doing.
-
-  COMPANY DIRECTION & TEAM:
-    curl -s http://localhost:3777/api/employees/${employee._id}/self/direction
-    Returns the company's strategic direction + direction history. Align your work with this.
-    curl -s http://localhost:3777/api/employees/${employee._id}/self/team
-    Lists all employees in your company and their current status.
-
   APPLICATION MANAGEMENT (CRITICAL — use these to manage company apps):
-    LIST all apps & used ports:
-      curl -s http://localhost:3777/api/employees/${employee._id}/self/applications
-      Returns: { applications: [...], usedPorts: [3001, 3002, ...] }
-      ALWAYS check this BEFORE choosing a port — pick one that is NOT in usedPorts.
-
     CREATE or UPDATE an application:
       curl -s -X POST http://localhost:3777/api/employees/${employee._id}/self/applications \\
         -H "Content-Type: application/json" \\
@@ -701,6 +728,47 @@ ${memoryCtx}${statusHistoryCtx}
 YOUR TASK:
 ${task}`;
 
+    // ── Model routing: resolve model for this task ──
+    const actionType = this.classifyTaskAction(task, employee.role);
+    const resolvedModel = await modelRoutingService.resolveModel(userId, {
+      action: actionType,
+      role: employee.role,
+      source: 'employee',
+    });
+
+    // Add sub-agent delegation instructions for Opus sessions
+    const subAgentDefaults = await modelRoutingService.getSubAgentDefaults(userId);
+    if (resolvedModel === 'opus') {
+      prompt += `
+
+SUB-AGENT MODEL DELEGATION (COST OPTIMIZATION):
+You are running on Opus (deep reasoning). To save costs, delegate routine work to cheaper sub-agents:
+- File exploration (Glob, Grep, Read): spawn sub-agent with model="${subAgentDefaults.exploration}"
+- Running commands (npm, docker, git, curl): spawn sub-agent with model="${subAgentDefaults.commands}"
+- Simple code edits (rename, imports, small fixes): spawn sub-agent with model="${subAgentDefaults.implementation}"
+- Feature implementation: spawn sub-agent with model="${subAgentDefaults.implementation}"
+- Test execution (including Playwright): spawn sub-agent with model="${subAgentDefaults.testing}"
+- Status updates (curl to API): spawn sub-agent with model="${subAgentDefaults.commands}"
+
+Keep Opus (yourself) for: planning, architecture, complex debugging, reviewing results, making decisions.
+When launching a sub-agent, specify the model parameter.`;
+    }
+
+    // Add escalation instructions if enabled
+    const escalationCheck = await modelRoutingService.checkEscalation(userId, 'opus');
+    if (escalationCheck.allowed && resolvedModel !== 'opus') {
+      prompt += `
+
+MODEL ESCALATION:
+If you encounter a problem that requires deeper reasoning (complex debugging, architectural decisions, multi-system analysis), you can request a model upgrade:
+  curl -s -X POST http://localhost:3777/api/employees/${employee._id}/self/escalate \\
+    -H "Content-Type: application/json" \\
+    -d '{"reason":"BRIEF EXPLANATION","requestedModel":"opus"}'
+Only use this for genuinely complex problems. Your session will restart with the upgraded model.`;
+    }
+
+    empLog(userId, eId, pId, 'text', `🤖 Model: ${resolvedModel} (action: ${actionType})`, empInfo, pName);
+
     const MAX_RETRIES = 3;
     let attempt = 0;
     let lastSdkSessionId: string | undefined;
@@ -712,16 +780,13 @@ ${task}`;
       if (event.type === 'start' && event.sessionId) {
         Employee.findByIdAndUpdate(employeeId, { activeSessionId: event.sessionId }).catch(() => {});
       }
-      // Task completed in keepAlive mode — mark employee idle without killing session
-      // task_idle: SDK conversation ended — keep session reference but do NOT set employee idle.
-      // The employee is responsible for calling task-done and setting themselves idle.
+      // Conversation ended in keepAlive mode — keep session reference for resume
       if (event.type === 'task_idle') {
         Employee.findById(employeeId).then(fresh => {
           if (!fresh) return;
           fresh.lastActivity = new Date();
           if (event.sessionId) fresh.activeSessionId = event.sessionId;
           fresh.save().catch(() => {});
-          // Collect inbox messages
           this.collectInboxMessages(userId, eId, pId, cwd, empInfo, pName, taskId).catch(() => {});
         }).catch(() => {});
       }
@@ -737,8 +802,26 @@ ${task}`;
           empLog(userId, eId, pId, 'error', `⚠️ Permission block detected — ${fixStatus}. Issues: ${check.issues.join('; ') || 'none'}`, empInfo, pName);
           telegramBot.send(`⚠️ *${employee.name}* is blocked by permissions on _${pName}_. Config ${check.fixed ? 'fixed' : 'OK'} — restart employee to apply: tell Alfred "restart ${employee.name}"`).catch(() => {});
         }
+      } else if (event.type === 'turn_usage' && event.turnUsage) {
+        // Record every AI turn's token usage individually (per-interaction granularity)
+        const tu = event.turnUsage;
+        tokenUsageService.record({
+          userId, employeeId: eId, projectId: pId,
+          source: 'employee',
+          aiModel: tu.model,
+          inputTokens: tu.inputTokens,
+          outputTokens: tu.outputTokens,
+          cacheReadTokens: tu.cacheReadTokens,
+          cacheCreationTokens: tu.cacheCreationTokens,
+          costUsd: 0, // cost is only available at segment level
+          numTurns: 1,
+          metadata: { taskId, taskDescription: task.substring(0, 200), employeeName: employee.name, employeeRole: employee.role, turn: true, tools: tu.tools },
+        });
+        empLog(userId, eId, pId, 'token_usage',
+          `📊 Turn: ${tu.inputTokens} in / ${tu.outputTokens} out | tools: ${tu.tools.join(', ') || 'text'}`,
+          empInfo, pName, { turnUsage: tu });
       } else if (event.type === 'token_usage' && event.tokenUsage) {
-        // Record every conversation segment's token usage individually
+        // Record conversation segment totals (includes cost from SDK result)
         const tu = event.tokenUsage;
         tokenUsageService.record({
           userId, employeeId: eId, projectId: pId,
@@ -751,10 +834,10 @@ ${task}`;
           costUsd: tu.costUsd,
           durationMs: tu.durationMs,
           numTurns: tu.numTurns,
-          metadata: { taskId, employeeName: employee.name, employeeRole: employee.role, segment: true },
+          metadata: { taskId, taskDescription: task.substring(0, 200), employeeName: employee.name, employeeRole: employee.role, segment: true },
         });
         empLog(userId, eId, pId, 'token_usage',
-          `💰 ${tu.inputTokens} in / ${tu.outputTokens} out / ${tu.cacheReadTokens} cache | $${tu.costUsd.toFixed(4)} | ${tu.numTurns} turns`,
+          `💰 Segment total: ${tu.inputTokens} in / ${tu.outputTokens} out / ${tu.cacheReadTokens} cache | $${tu.costUsd.toFixed(4)} | ${tu.numTurns} turns`,
           empInfo, pName, { tokenUsage: tu });
       } else if (event.type === 'text') {
         empLog(userId, eId, pId, 'text', (event.content || '').substring(0, 1200), empInfo, pName);
@@ -789,7 +872,7 @@ ${task}`;
         // Always start fresh — never resume old sessions (saves ~20M cache tokens).
         // The employee gets context from working status history injected in the prompt.
         const currentPrompt = isRetry
-          ? `You were working on a task but got interrupted. Continue where you left off. Check your working status history and the project files to understand where you stopped. The original task was:\n\n${task}\n\nPick up from where you stopped — do NOT start over.`
+          ? `You were working on a task but got interrupted. Continue where you left off.\n\nFIRST: Run these curl commands to recall your memory:\n  curl -s http://localhost:3777/api/employees/${employeeId}/self/status-history?limit=5\n  curl -s http://localhost:3777/api/employees/${employeeId}\n\nRead the status history carefully — it tells you exactly where you stopped and what progress was made.\n\nThe original task was:\n\n${task}\n\nPick up from where you stopped — do NOT start over.`
           : prompt;
 
         try {
@@ -797,8 +880,16 @@ ${task}`;
             allowedTools: SDK_ALLOWED_TOOLS,
             // No resumeSdkSessionId — always fresh session to avoid 20M+ cache costs
             keepAlive: true,
+            model: resolvedModel,
             mcpServers: {
               playwright: { command: 'npx', args: ['@playwright/mcp@latest'] },
+            },
+            shouldContinue: async () => {
+              // Auto-continue only if the task result is still empty (employee didn't call task-done)
+              const fresh = await Employee.findById(employeeId);
+              if (!fresh) return false;
+              const task = fresh.taskHistory.find(t => t.taskId === taskId);
+              return task?.status === 'in_progress' && !task.result;
             },
           });
 

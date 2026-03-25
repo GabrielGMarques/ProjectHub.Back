@@ -16,6 +16,8 @@ import { Project } from '../models/project.model';
 import { managerService } from '../services/manager.service';
 import { InfrastructureService } from '../services/infrastructure.service';
 import { ManagerInbox } from '../models/manager-inbox.model';
+import { modelRoutingService } from '../services/model-routing.service';
+import { ModelTier } from '../models/model-routing.model';
 
 const infraService = new InfrastructureService();
 
@@ -730,6 +732,82 @@ export class EmployeeController {
       managerService.onEmployeeEvent(emp.name, 'inbox_message');
 
       res.status(201).json({ message: 'Message sent to Alfred', inboxId: msg._id.toString() });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+
+  /** POST /employees/:id/self/escalate — request model upgrade mid-task (no auth) */
+  async selfEscalate(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const emp = await Employee.findById(req.params.id);
+      if (!emp) { res.status(404).json({ error: 'Employee not found' }); return; }
+
+      const { reason, requestedModel } = req.body;
+      if (!requestedModel || !['sonnet', 'opus'].includes(requestedModel)) {
+        res.status(400).json({ error: 'requestedModel must be sonnet or opus' }); return;
+      }
+      if (!reason) {
+        res.status(400).json({ error: 'reason is required' }); return;
+      }
+
+      const userId = emp.userId.toString();
+
+      // Check escalation config
+      const check = await modelRoutingService.checkEscalation(userId, requestedModel as ModelTier);
+      if (!check.allowed) {
+        res.status(403).json({ error: check.reason }); return;
+      }
+
+      // Rate limit: 1 escalation per employee per hour
+      const recentEscalation = await EmployeeLog.findOne({
+        employeeId: emp._id,
+        category: 'text',
+        content: { $regex: /^🚀 Model escalation/ },
+        createdAt: { $gte: new Date(Date.now() - 3600000) },
+      });
+      if (recentEscalation) {
+        res.status(429).json({ error: 'Rate limited: max 1 escalation per hour' }); return;
+      }
+
+      // Log the escalation
+      const empInfo = { name: emp.name, avatar: emp.avatar, role: emp.role };
+      const project = await Project.findById(emp.projectId).select('name').lean();
+      const pName = project?.name || 'Unknown';
+
+      EmployeeLog.create({
+        userId: emp.userId, employeeId: emp._id, projectId: emp.projectId,
+        category: 'text',
+        content: `🚀 Model escalation requested: ${requestedModel} — Reason: ${reason}`,
+        employeeName: emp.name, employeeAvatar: emp.avatar, employeeRole: emp.role,
+        projectName: pName,
+      }).catch(() => {});
+
+      // Notify Alfred
+      managerService.onEmployeeEvent(emp.name, 'status_update');
+      telegramBot.send(`🚀 *${emp.avatar} ${emp.name}* requested model upgrade to *${requestedModel}*\nReason: ${reason}`).catch(() => {});
+
+      // Get current task to re-assign with upgraded model
+      const currentTask = emp.taskHistory.find(t => t.status === 'in_progress');
+      if (currentTask) {
+        // Stop current session and restart with upgraded model
+        const employeeService = new EmployeeService();
+        await employeeService.stopTask(userId, emp._id.toString());
+
+        // Re-assign the same task — classifyTaskAction will pick up the action type,
+        // but we override via a temporary action route
+        // For now, we directly assign with context about escalation
+        const escalatedTask = `[SYSTEM] Your session was upgraded to ${requestedModel} because you requested it.
+Reason: ${reason}
+Continue working on your previous task from where you left off. Check your working status history for context.
+
+ORIGINAL TASK:
+${currentTask.description}`;
+
+        employeeService.assignTask(userId, emp._id.toString(), escalatedTask, () => {}).catch(() => {});
+      }
+
+      res.json({ message: `Model escalation to ${requestedModel} approved. Session restarting.`, approved: true });
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
