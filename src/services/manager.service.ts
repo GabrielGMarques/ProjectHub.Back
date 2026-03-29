@@ -20,6 +20,7 @@ import { infrastructureService } from './infrastructure.service';
 import { WorkingStatusHistory } from '../models/working-status-history.model';
 import { DirectionHistory } from '../models/direction-history.model';
 import { modelRoutingService } from './model-routing.service';
+import { bruceTodoService } from './bruce-todo.service';
 
 const telegramService = telegramBot;
 const employeeService = new EmployeeService();
@@ -524,7 +525,7 @@ Be Alfred. Be sharp. Hit the ground running.`;
       persistLog('ai_call', `AI responded in ${(elapsed / 1000).toFixed(1)}s`, { userId, metadata: { durationMs: elapsed, responseLength: response.length } });
 
       // Parse and execute any actions — with follow-up loop for read actions
-      const READ_ACTIONS = new Set(['read_employee_status', 'read_employee_status_history', 'read_task_results', 'ask_employee', 'read_direction', 'recall_memory']);
+      const READ_ACTIONS = new Set(['read_employee_status', 'read_employee_status_history', 'read_task_results', 'ask_employee', 'read_direction', 'recall_memory', 'list_bruce_todos']);
       const MAX_FOLLOW_UPS = 3;
       let currentResponse = response;
       let finalClean = '';
@@ -869,7 +870,7 @@ Be Alfred. Be sharp. Hit the ground running.`;
         .map(f => ({ name: f, stat: fs.statSync(path.join(filesDir, f)) }))
         .filter(f => f.stat.isFile())
         .sort((a, b) => b.stat.mtime.getTime() - a.stat.mtime.getTime())
-        .slice(0, 10);
+        .slice(0, 10) ;
       if (recentFiles.length) {
         ctx += `\n=== 📁 BRUCE'S FILES (ManagerMemory/files/) ===\n`;
         ctx += `Files Bruce sent you via Telegram. Use read_bruce_file to read their contents.\n`;
@@ -879,6 +880,13 @@ Be Alfred. Be sharp. Hit the ground running.`;
           ctx += `  📄 ${f.name} (${size}, ${age < 60 ? age + 'min' : Math.round(age / 60) + 'h'} ago)\n`;
         }
       }
+    }
+
+    // Bruce's personal todos
+    const bruceTodosSummary = await bruceTodoService.summaryForContext(userId);
+    if (bruceTodosSummary) {
+      ctx += bruceTodosSummary;
+      ctx += `  → Remind Bruce of high-priority action items. Use add_bruce_todos/complete_bruce_todo/remove_bruce_todo to manage.\n`;
     }
 
     // Available roles
@@ -917,6 +925,26 @@ You can execute actions by including action blocks in your response. Use this ex
 \`\`\`manager-action
 {"action": "remove_todo", "projectId": "<id>", "todoText": "exact todo text to remove"}
 \`\`\`
+
+\`\`\`manager-action
+{"action": "add_bruce_todos", "items": [{"text": "Review the new auth flow on Amigo"}, {"text": "Set up Stripe webhook for MusicApp", "priority": "high"}]}
+\`\`\`
+Add action items / todos for Bruce. These are things Bruce needs to do on his projects. Priority: "low", "normal" (default), "high".
+
+\`\`\`manager-action
+{"action": "complete_bruce_todo", "todoText": "exact todo text"}
+\`\`\`
+Mark a Bruce todo as done.
+
+\`\`\`manager-action
+{"action": "remove_bruce_todo", "todoText": "exact todo text"}
+\`\`\`
+Delete a Bruce todo entirely (not done — removed).
+
+\`\`\`manager-action
+{"action": "list_bruce_todos"}
+\`\`\`
+List Bruce's open todos (read action — results come back to you).
 
 \`\`\`manager-action
 {"action": "reset_employees", "projectId": "<id>"}
@@ -1375,6 +1403,33 @@ RULES:
         if (before === after) throw new Error(`Todo not found: "${text}"`);
         await project.save();
         return `Removed todo "${text}" from ${project.name}`;
+      }
+      case 'add_bruce_todos': {
+        const items = action.items || [];
+        if (!items.length) throw new Error('items array is required');
+        const todos = await bruceTodoService.addMany(userId, items);
+        return `Added ${todos.length} todo(s) for Bruce: ${todos.map((t: any) => t.text).join(', ')}`;
+      }
+      case 'complete_bruce_todo': {
+        const text = action.todoText?.trim();
+        if (!text) throw new Error('todoText is required');
+        const todo = await bruceTodoService.markDoneByText(userId, text);
+        if (!todo) throw new Error(`Bruce todo not found: "${text}"`);
+        return `✅ Marked Bruce's todo as done: "${text}"`;
+      }
+      case 'remove_bruce_todo': {
+        const text = action.todoText?.trim();
+        if (!text) throw new Error('todoText is required');
+        const ok = await bruceTodoService.removeByText(userId, text);
+        if (!ok) throw new Error(`Bruce todo not found: "${text}"`);
+        return `Removed Bruce's todo: "${text}"`;
+      }
+      case 'list_bruce_todos': {
+        const todos = await bruceTodoService.pending(userId);
+        if (!todos.length) return 'Bruce has no pending todos.';
+        const priorityIcon = (p: string) => p === 'high' ? '🔴' : p === 'low' ? '⚪' : '🟡';
+        const lines = todos.map((t: any) => `${priorityIcon(t.priority)} ${t.text}${t.category ? ` [${t.category}]` : ''}`);
+        return `Bruce's pending todos (${todos.length}):\n${lines.join('\n')}`;
       }
       case 'reset_employees': {
         const employees = await Employee.find({ userId, projectId: action.projectId });
@@ -3070,7 +3125,7 @@ RULES:
           try {
             const context = await this.buildContext(userId, lastMsg.content);
             const msgHistory = history.slice(-MAX_HISTORY).map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }));
-            const READ_ACTIONS_RECOVERY = new Set(['read_employee_status', 'read_employee_status_history', 'read_task_results', 'ask_employee', 'read_direction', 'recall_memory']);
+            const READ_ACTIONS_RECOVERY = new Set(['read_employee_status', 'read_employee_status_history', 'read_task_results', 'ask_employee', 'read_direction', 'recall_memory', 'list_bruce_todos']);
             let recoveryResponse = await this.callAI(context, msgHistory, userId, unansweredModel);
             this.lastResponseAt = Date.now();
 
@@ -3327,7 +3382,7 @@ ${strategicCtx ? `STRATEGIC ACTION NEEDED:\n${strategicCtx}` : ''}
 If everything is genuinely fine and there's nothing actionable, just write to your daily log and say nothing on Telegram.`;
 
           const scanModel = await modelRoutingService.resolveModel(userId, { action: 'proactive_scan', source: 'alfred' });
-          const READ_ACTIONS_PROACTIVE = new Set(['read_employee_status', 'read_employee_status_history', 'read_task_results', 'ask_employee', 'read_direction', 'recall_memory']);
+          const READ_ACTIONS_PROACTIVE = new Set(['read_employee_status', 'read_employee_status_history', 'read_task_results', 'ask_employee', 'read_direction', 'recall_memory', 'list_bruce_todos']);
           const proactiveHistory: { role: 'user' | 'assistant'; content: string }[] = [{ role: 'user', content: scanPrompt }];
           let proactiveResponse = await this.callAI(context, proactiveHistory, userId, scanModel);
           this.lastResponseAt = Date.now();

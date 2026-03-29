@@ -15,6 +15,7 @@ import telemetryRoutes from './routes/telemetry.routes';
 import telegramRoutes from './routes/telegram.routes';
 import infrastructureRoutes from './routes/infrastructure.routes';
 import settingsRoutes from './routes/settings.routes';
+import bruceTodoRoutes from './routes/bruce-todo.routes';
 
 const app = express();
 
@@ -39,6 +40,7 @@ app.use('/api/telemetry', telemetryRoutes);
 app.use('/api/telegram', telegramRoutes);
 app.use('/api/infrastructure', infrastructureRoutes);
 app.use('/api/settings', settingsRoutes);
+app.use('/api/bruce-todos', bruceTodoRoutes);
 
 // Health check
 app.get('/api/health', (_req, res) => {

@@ -596,9 +596,17 @@ Before writing a single line of code, you MUST recall what happened before. Run 
 
 4. GET TEAM STATUS (what teammates are doing):
    curl -s http://localhost:3777/api/employees/${employee._id}/self/team
-   → Lists all employees and their current status. Check for dependencies/blockers.
+   → Lists all employees with their current status and working status. Check for dependencies/blockers.
+   → Each teammate has an _id — use it to get more details below.
 
-5. LIST APPLICATIONS (existing apps, ports, services):
+5. GET COLLEAGUE DETAILS (status history + task history of a specific teammate):
+   curl -s http://localhost:3777/api/employees/${employee._id}/self/teammate/<COLLEAGUE_ID>
+   → Returns their working status, last 5 status history entries, and last 5 tasks with results.
+   → Add ?limit=20 to get more entries (max 50).
+   → Use this BEFORE asking Alfred about a colleague — the answer is probably already here.
+   → Use this to check if a colleague already built something you need, or if they're blocked.
+
+6. LIST APPLICATIONS (existing apps, ports, services):
    curl -s http://localhost:3777/api/employees/${employee._id}/self/applications
    → Returns registered apps and used ports. ALWAYS check before choosing a port.
 

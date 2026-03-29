@@ -245,8 +245,9 @@ export class EmployeeController {
       const teammate = await Employee.findById(req.params.teammateId)
         .select('name title role avatar status workingStatus workingStatusAt taskHistory').lean();
       if (!teammate) { res.status(404).json({ error: 'Employee not found' }); return; }
+      const limit = Math.min(parseInt(req.query.limit as string) || 5, 50);
       const statusHistory = await WorkingStatusHistory.find({ employeeId: req.params.teammateId })
-        .sort({ createdAt: -1 }).limit(10).lean();
+        .sort({ createdAt: -1 }).limit(limit).lean();
       res.json({
         name: teammate.name,
         title: teammate.title,
@@ -254,7 +255,7 @@ export class EmployeeController {
         status: teammate.status,
         workingStatus: teammate.workingStatus,
         workingStatusAt: teammate.workingStatusAt,
-        taskHistory: (teammate.taskHistory || []).slice(-10).map((t: any) => ({
+        taskHistory: (teammate.taskHistory || []).slice(-limit).map((t: any) => ({
           taskId: t.taskId, description: t.description, status: t.status,
           result: t.result?.substring(0, 500), startedAt: t.startedAt, completedAt: t.completedAt,
         })),
