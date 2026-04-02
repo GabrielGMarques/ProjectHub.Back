@@ -5,10 +5,12 @@ import { ProjectService } from '../services/project.service';
 import { AIService, AIModel } from '../services/ai.service';
 import { ClaudeCodeService } from '../services/claude-code.service';
 
+import { TelemetryService } from '../services/telemetry.service';
 const skillService = new SkillService();
 const projectService = new ProjectService();
 const aiService = new AIService();
 const claudeCodeService = new ClaudeCodeService();
+const telemetryService = new TelemetryService();
 
 export class SkillController {
   async getAll(req: AuthRequest, res: Response): Promise<void> {
@@ -69,7 +71,8 @@ export class SkillController {
         const response = await aiService.coach(
           project,
           [{ role: 'user', content: skill.prompt }],
-          model
+          model,
+          req.userId
         );
         res.json({ response, mode: 'ai-chat' });
       } catch (error: any) {
@@ -77,8 +80,9 @@ export class SkillController {
       }
     } else {
       // claude-code mode: SSE stream
-      if (!project.localPath) {
-        res.status(400).json({ error: 'Project has no local path configured' });
+      const skillCwd = (project.folders || [])[0] || project.localPath;
+      if (!skillCwd) {
+        res.status(400).json({ error: 'Project has no folders configured' });
         return;
       }
       const availability = await claudeCodeService.checkAvailability();
@@ -100,11 +104,31 @@ export class SkillController {
         'Connection': 'keep-alive',
       });
 
+      const startTime = Date.now();
+      telemetryService.track({
+        userId: req.userId!, projectId: req.params.projectId,
+        type: 'agent_run', source: `skill:${skill.name}`, status: 'started',
+        description: skill.prompt.substring(0, 200),
+      });
+
       try {
-        await claudeCodeService.runCommand(project.localPath, skillPrompt, (event) => {
+        const result = await claudeCodeService.runCommand(skillCwd, skillPrompt, (event) => {
           res.write(`data: ${JSON.stringify(event)}\n\n`);
         });
+        telemetryService.track({
+          userId: req.userId!, projectId: req.params.projectId,
+          type: 'agent_run', source: `skill:${skill.name}`,
+          status: result.status === 'completed' ? 'completed' : 'failed',
+          description: skill.prompt.substring(0, 200),
+          durationMs: Date.now() - startTime,
+        });
       } catch (error: any) {
+        telemetryService.track({
+          userId: req.userId!, projectId: req.params.projectId,
+          type: 'error', source: `skill:${skill.name}`, status: 'failed',
+          description: skill.prompt.substring(0, 200),
+          error: error.message, durationMs: Date.now() - startTime,
+        });
         res.write(`data: ${JSON.stringify({ type: 'error', content: error.message, sessionId: '', timestamp: new Date() })}\n\n`);
       }
       res.end();

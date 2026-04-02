@@ -1,9 +1,10 @@
-import Anthropic from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import fs from 'fs';
 import path from 'path';
 import { IProject } from '../models/project.model';
+import { claudeChat, isClaudeAvailable, getLastUsage } from './claude-proxy.service';
+import { TokenUsageService } from './token-usage.service';
 
 let pdfParse: any;
 try {
@@ -31,65 +32,83 @@ const MODEL_IDS: Record<AIModel, string> = {
 };
 
 export class AIService {
-  private anthropic: Anthropic | null = null;
+  private claudeAvailable: boolean | null = null;
   private openai: OpenAI | null = null;
   private gemini: GoogleGenerativeAI | null = null;
+  private tokenUsageService = new TokenUsageService();
 
   constructor() {
-    if (process.env.ANTHROPIC_API_KEY) {
-      this.anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-    }
     if (process.env.OPENAI_API_KEY) {
       this.openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     }
     if (process.env.GEMINI_API_KEY) {
       this.gemini = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
     }
+    // Claude availability checked lazily via SDK
   }
 
   get isConfigured(): boolean {
-    return this.anthropic !== null || this.openai !== null || this.gemini !== null;
+    // Assume Claude is available (checked lazily); also check other providers
+    return true;
   }
 
-  getAvailableModels(): { id: AIModel; name: string; available: boolean }[] {
+  private async checkClaude(): Promise<boolean> {
+    if (this.claudeAvailable === null) {
+      this.claudeAvailable = await isClaudeAvailable();
+    }
+    return this.claudeAvailable;
+  }
+
+  async getAvailableModels(): Promise<{ id: AIModel; name: string; available: boolean }[]> {
+    const claude = await this.checkClaude();
     return [
-      { id: 'claude-sonnet', name: 'Claude Sonnet', available: this.anthropic !== null },
+      { id: 'claude-sonnet', name: 'Claude Sonnet', available: claude },
       { id: 'gpt-4o', name: 'GPT-4o', available: this.openai !== null },
       { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash', available: this.gemini !== null },
     ];
   }
 
-  async coach(project: IProject, messages: ChatMessage[], model: AIModel = 'claude-sonnet'): Promise<string> {
+  async coach(project: IProject, messages: ChatMessage[], model: AIModel = 'claude-sonnet', userId?: string): Promise<string> {
     const docTexts = await this.extractDocumentTexts(project);
     const systemPrompt = this.buildSystemPrompt(project, docTexts);
 
     switch (model) {
       case 'claude-sonnet':
-        return this.callClaude(systemPrompt, messages);
+        return this.callClaude(systemPrompt, messages, userId);
       case 'gpt-4o':
-        return this.callOpenAI(systemPrompt, messages);
+        return this.callOpenAI(systemPrompt, messages, userId);
       case 'gemini-2.5-flash':
-        return this.callGemini(systemPrompt, messages);
+        return this.callGemini(systemPrompt, messages, userId);
       default:
         throw new Error(`Unknown model: ${model}`);
     }
   }
 
-  private async callClaude(systemPrompt: string, messages: ChatMessage[]): Promise<string> {
-    if (!this.anthropic) {
-      throw new Error('Claude is not configured. Set ANTHROPIC_API_KEY in your environment.');
+  private async callClaude(systemPrompt: string, messages: ChatMessage[], userId?: string): Promise<string> {
+    const available = await this.checkClaude();
+    if (!available) {
+      throw new Error('Claude is not available. Ensure Claude Code CLI is installed and authenticated.');
     }
-    const response = await this.anthropic.messages.create({
-      model: MODEL_IDS['claude-sonnet'],
-      max_tokens: 2048,
+    const result = await claudeChat({
       system: systemPrompt,
       messages: messages.map(m => ({ role: m.role, content: m.content })),
     });
-    const block = response.content[0];
-    return block.type === 'text' ? block.text : '';
+
+    // Record token usage
+    const usage = getLastUsage();
+    if (usage && userId) {
+      this.tokenUsageService.record({
+        userId, source: 'coach', aiModel: usage.model,
+        inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
+        cacheReadTokens: usage.cacheReadTokens, cacheCreationTokens: usage.cacheCreationTokens,
+        costUsd: usage.costUsd, durationMs: usage.durationMs, numTurns: usage.numTurns,
+      });
+    }
+
+    return result;
   }
 
-  private async callOpenAI(systemPrompt: string, messages: ChatMessage[]): Promise<string> {
+  private async callOpenAI(systemPrompt: string, messages: ChatMessage[], userId?: string): Promise<string> {
     if (!this.openai) {
       throw new Error('GPT is not configured. Set OPENAI_API_KEY in your environment.');
     }
@@ -101,10 +120,20 @@ export class AIService {
         ...messages.map(m => ({ role: m.role as 'user' | 'assistant', content: m.content })),
       ],
     });
+
+    // Record token usage
+    if (response.usage && userId) {
+      this.tokenUsageService.record({
+        userId, source: 'coach', aiModel: response.model || 'gpt-4o',
+        inputTokens: response.usage.prompt_tokens || 0,
+        outputTokens: response.usage.completion_tokens || 0,
+      });
+    }
+
     return response.choices[0]?.message?.content || '';
   }
 
-  private async callGemini(systemPrompt: string, messages: ChatMessage[]): Promise<string> {
+  private async callGemini(systemPrompt: string, messages: ChatMessage[], userId?: string): Promise<string> {
     if (!this.gemini) {
       throw new Error('Gemini is not configured. Set GEMINI_API_KEY in your environment.');
     }
@@ -121,6 +150,17 @@ export class AIService {
     const chat = model.startChat({ history });
     const lastMessage = messages[messages.length - 1];
     const result = await chat.sendMessage(lastMessage.content);
+
+    // Record token usage
+    const meta = result.response.usageMetadata;
+    if (meta && userId) {
+      this.tokenUsageService.record({
+        userId, source: 'coach', aiModel: 'gemini-2.5-flash',
+        inputTokens: meta.promptTokenCount || 0,
+        outputTokens: meta.candidatesTokenCount || 0,
+      });
+    }
+
     return result.response.text();
   }
 
@@ -152,12 +192,46 @@ ${project.monetizationPlan || 'Not set'}`;
       prompt += `\n\nPROJECT PRESENTATION:\n${project.presentation}`;
     }
 
+    if (project.applications?.length) {
+      prompt += '\n\nAPPLICATIONS:\n';
+      for (const app of project.applications) {
+        prompt += `- ${app.name} (${app.type}:${app.port}) — ${app.status}${app.testInstructions ? ' — has test instructions' : ' — NO test instructions'}\n`;
+      }
+    }
+
     if (docTexts.length > 0) {
       prompt += '\n\nATTACHED DOCUMENTS:\n';
       prompt += docTexts.join('\n\n');
     }
 
-    prompt += '\n\nUse the above context to provide relevant, actionable coaching advice. Reference specific details from the project and documents when applicable.';
+    prompt += `\n\nACTIONS:
+You can suggest concrete changes to the project by including action blocks in your response. Use this exact format:
+
+\`\`\`coach-action
+{"type": "add_todos", "items": ["Task 1", "Task 2"]}
+\`\`\`
+
+\`\`\`coach-action
+{"type": "update_presentation", "content": "Full new presentation markdown content here"}
+\`\`\`
+
+\`\`\`coach-action
+{"type": "update_field", "field": "description", "value": "New value"}
+\`\`\`
+
+Available action types:
+- add_todos: Add items to the project's TODO list. Use "items" array with string values.
+- update_presentation: Update the project presentation. Use "content" with the full markdown text.
+- update_field: Update a specific project field. Available fields: description, niche, monetizationPlan, testInstructions. Use "field" and "value".
+
+IMPORTANT RULES FOR ACTIONS:
+- Only suggest actions when making a specific, concrete recommendation or when the user asks for changes.
+- Always explain what you're suggesting and why BEFORE the action block.
+- The user will see Apply/Dismiss buttons for each action — nothing happens without their confirmation.
+- Don't use actions for every response — only when there's a real change to propose.
+- You can include multiple action blocks in one response if needed.
+
+Use the above context to provide relevant, actionable coaching advice. Reference specific details from the project and documents when applicable.`;
 
     return prompt;
   }

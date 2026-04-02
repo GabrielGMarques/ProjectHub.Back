@@ -47,6 +47,10 @@ export const validateProject: ValidationChain[] = [
     .optional()
     .isFloat({ min: 0 })
     .withMessage('Time consumption must be a non-negative number'),
+  body('timeSpent')
+    .optional()
+    .isFloat({ min: 0 })
+    .withMessage('Time spent must be a non-negative number'),
   body('todos')
     .optional()
     .isArray()
@@ -80,6 +84,17 @@ export const validateProject: ValidationChain[] = [
   body('schedule.friday').optional().isFloat({ min: 0, max: 24 }),
   body('schedule.saturday').optional().isFloat({ min: 0, max: 24 }),
   body('schedule.sunday').optional().isFloat({ min: 0, max: 24 }),
+  body('timeSpentPerDay')
+    .optional()
+    .isObject()
+    .withMessage('Time spent per day must be an object'),
+  body('timeSpentPerDay.monday').optional().isFloat({ min: 0, max: 24 }),
+  body('timeSpentPerDay.tuesday').optional().isFloat({ min: 0, max: 24 }),
+  body('timeSpentPerDay.wednesday').optional().isFloat({ min: 0, max: 24 }),
+  body('timeSpentPerDay.thursday').optional().isFloat({ min: 0, max: 24 }),
+  body('timeSpentPerDay.friday').optional().isFloat({ min: 0, max: 24 }),
+  body('timeSpentPerDay.saturday').optional().isFloat({ min: 0, max: 24 }),
+  body('timeSpentPerDay.sunday').optional().isFloat({ min: 0, max: 24 }),
 ];
 
 export const validateCreateProject: ValidationChain[] = [
