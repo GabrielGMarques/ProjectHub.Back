@@ -55,6 +55,7 @@ const REFERENCE_SETTINGS_LOCAL = {
       "Bash(tar *)",
       "Bash(unzip *)",
       "Bash(ngrok *)",
+      "Bash(gws *)",
       "Read",
       "Edit",
       "Write",
@@ -97,6 +98,7 @@ const REFERENCE_GLOBAL_TOOLS = [
   'Bash(python *)', 'Bash(pip *)', 'Bash(mkdir *)', 'Bash(ls *)', 'Bash(cat *)',
   'Bash(rm *)', 'Bash(cp *)', 'Bash(mv *)', 'Bash(touch *)', 'Bash(find *)',
   'Bash(grep *)', 'Bash(echo *)', 'Bash(cd *)', 'Bash(pwd)',
+  'Bash(gws *)',
   'Bash(tsc *)', 'Bash(tar *)', 'Bash(unzip *)', 'Bash(ngrok *)',
   'Bash(which *)', 'Bash(type *)',
   'Read', 'Edit', 'Write', 'Glob', 'Grep', 'WebSearch', 'WebFetch',
@@ -441,6 +443,8 @@ export class EmployeeService {
 
     // Ensure comms directory
     this.ensureCommsDir(project);
+    // Ensure per-employee personal skills directory
+    this.ensurePersonalSkillsDir(cwd, employee.name);
 
     // Build the agent prompt with role context + comms access
     // Normalize all paths to forward slashes — prevents agent confusion on Windows
@@ -452,6 +456,7 @@ export class EmployeeService {
 
     // Build skills context — employee's assigned skills + discovered local Claude Code skills
     const skillsCtx = this.buildSkillsContext(employee, cwd);
+    const personalSkillsCtx = this.buildPersonalSkillsContext(employee, cwd);
     const memoryCtx = await employeeMemoryService.buildMemoryContext(employee._id.toString(), 5);
 
     // Fetch recent working status history so employee can pick up context without resuming old sessions
@@ -549,6 +554,7 @@ Your workspace has a .claude/settings.local.json that pre-approves these command
 - git (any arguments) — commits, branches, status, etc.
 - docker, docker-compose — building images, running containers, managing services
 - ngrok — exposing local services for testing and demos
+- gws — Google Workspace CLI (Drive, Docs, Sheets, etc.)
 - curl, wget — HTTP requests, downloading files
 - tar, unzip — extracting archives
 - python, pip — Python scripts and package management
@@ -562,6 +568,41 @@ A helper script exists at scripts/write-file.js in the workspace root.
 Usage: node scripts/write-file.js <filepath> "<content>"
 This creates the file AND its parent directories — no Read required first.
 Use this when you need to create a brand new file and the Write tool complains about not having Read it first.
+
+GOOGLE DRIVE PUBLISHING (gws CLI) — YOU HAVE THIS TOOL:
+You have access to "gws" — the Google Workspace CLI — pre-authenticated on this machine.
+Use it to create folders, upload files, and publish deliverables DIRECTLY to Google Drive.
+This means you CAN and SHOULD publish deliverables to Google Drive — not just save them locally.
+When your task produces deliverables (reports, docs, exports, built artifacts, images, PDFs, etc.),
+ALWAYS upload them to Google Drive and share the link in your task result or working status.
+
+FOLDER NAMING CONVENTION (MANDATORY):
+Your workspace folder name is the company/project identifier. Use it as the Google Drive folder name.
+For example, if your working directory is D:/GrowthMaster/Repos/AIInfluencer, the Drive folder
+must be named "AIInfluencer". This keeps Drive organized — one folder per project, mirroring the local structure.
+NEVER upload files to the Drive root. ALWAYS place them inside the correct project folder.
+
+Key commands:
+- List files/folders:
+  gws drive files list --params '{"q": "name=\"FolderName\" and mimeType=\"application/vnd.google-apps.folder\"", "fields": "files(id,name,webViewLink)"}'
+- Create a folder:
+  gws drive files create --params '{"name": "MyFolder", "mimeType": "application/vnd.google-apps.folder"}'
+- Create a subfolder inside a parent:
+  gws drive files create --params '{"name": "SubFolder", "mimeType": "application/vnd.google-apps.folder", "parents": ["PARENT_FOLDER_ID"]}'
+- Upload a file to a folder:
+  gws drive files create --params '{"name": "filename.ext", "parents": ["FOLDER_ID"]}' --upload-file /path/to/local/file
+- Make a file publicly viewable:
+  gws drive permissions create --file-id FILE_ID --params '{"role": "reader", "type": "anyone"}'
+- Get shareable link:
+  gws drive files get --file-id FILE_ID --params '{"fields": "webViewLink"}'
+
+Publishing workflow:
+1. Extract your project folder name from your working directory path (last segment, e.g., "AIInfluencer" from D:/GrowthMaster/Repos/AIInfluencer).
+2. Search Drive for a folder with that exact name. If it doesn't exist, create it.
+3. If you need sub-organization, create subfolders inside the project folder (e.g., "AIInfluencer/reports/", "AIInfluencer/deliverables/").
+4. Upload deliverables to the correct folder.
+5. Get the shareable link and include it in your task result or working status.
+6. ALWAYS mention the Drive link when reporting task completion — Bruce and Alfred expect deliverables on Drive, not just locally.
 
 ANTI-LOOP PROTECTION (MANDATORY):
 If a tool call or command fails, returns an error, or is denied:
@@ -732,6 +773,48 @@ TASK COMPLETION (2-step — write JSON file then curl it):
     Write "STATE: done and idle" in: ${normCwd}/.agents/status/${employee.role}.md
 
 ${skillsCtx}
+${personalSkillsCtx}
+PERSONAL SKILLS — YOUR SELF-LEARNING SYSTEM:
+You have a personal skills directory where you can save behaviors, patterns, and knowledge
+you want to remember across sessions. This is YOUR space — you control what goes in it.
+
+Directory: ${normCwd}/.agents/personal-skills/${this.slugifyName(employee.name)}/
+
+WHEN TO CREATE A PERSONAL SKILL FILE:
+- You discover a pattern that works well (e.g., "always run lint before commit in this repo")
+- You learn a project-specific convention (e.g., "API routes follow /v1/resource/:id pattern")
+- You figure out a tricky setup (e.g., "Docker build needs --legacy-peer-deps flag")
+- You develop a workflow that saves time (e.g., "test with curl first, then write Playwright tests")
+- You learn a preference from Alfred or the team (e.g., "Alfred prefers PRs under 200 lines")
+- You find something that keeps tripping you up and want to avoid it next time
+
+HOW TO CREATE:
+  Write a markdown file to your personal skills directory:
+    ${normCwd}/.agents/personal-skills/${this.slugifyName(employee.name)}/<skill-name>.md
+
+  Use this format:
+    # <Skill Title>
+    ## What
+    <What this skill/behavior is about — 1-2 sentences>
+    ## Why
+    <Why you created this — what triggered it>
+    ## Rules
+    - <Specific rule or behavior to follow>
+    - <Another rule>
+    ## Examples
+    <Optional: concrete examples of applying this skill>
+
+GUIDELINES:
+- Keep each file focused on ONE topic (don't dump everything into one file)
+- Name files descriptively: "docker-build-gotchas.md", "api-conventions.md", "testing-workflow.md"
+- Update existing files when you learn more — don't create duplicates
+- Delete files that are no longer relevant
+- Max 8 files are loaded per session — keep only what matters most
+- These files PERSIST and are loaded into your context EVERY session — they make you better over time
+
+This is how you become an expert at YOUR job in THIS company. The more useful skills you save,
+the faster and smarter you work in future sessions.
+
 ${memoryCtx}${statusHistoryCtx}
 YOUR TASK:
 ${task}`;
@@ -1328,6 +1411,10 @@ INSTRUCTIONS:
     if (!fs.existsSync(taskResultsDir)) {
       fs.mkdirSync(taskResultsDir, { recursive: true });
     }
+    const personalSkillsDir = path.join(cwd, '.agents', 'personal-skills');
+    if (!fs.existsSync(personalSkillsDir)) {
+      fs.mkdirSync(personalSkillsDir, { recursive: true });
+    }
 
     // Level 1-2: Auto-provision .claude/settings.local.json with permission allowlist
     this.ensureClaudeSettings(cwd);
@@ -1571,6 +1658,65 @@ INSTRUCTIONS:
     }
 
     return { valid: issues.length === 0, issues, fixed };
+  }
+
+  /** Slugify an employee name for use in directory paths */
+  private slugifyName(name: string): string {
+    return name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  }
+
+  /** Ensure personal skills directory exists for an employee */
+  private ensurePersonalSkillsDir(cwd: string, employeeName: string): string {
+    const slug = this.slugifyName(employeeName);
+    const dir = path.join(cwd, '.agents', 'personal-skills', slug);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    return dir;
+  }
+
+  /** Load personal skill files created by the employee in previous sessions */
+  private buildPersonalSkillsContext(employee: IEmployee, cwd: string): string {
+    const slug = this.slugifyName(employee.name);
+    const dir = path.join(cwd, '.agents', 'personal-skills', slug);
+    if (!fs.existsSync(dir)) return '';
+
+    try {
+      const files = fs.readdirSync(dir).filter(f => f.endsWith('.md')).sort();
+      if (!files.length) return '';
+
+      const MAX_FILES = 8;
+      const MAX_CHARS_PER_FILE = 2000;
+      const loaded: string[] = [];
+
+      for (const file of files.slice(0, MAX_FILES)) {
+        try {
+          let content = fs.readFileSync(path.join(dir, file), 'utf-8').trim();
+          if (!content) continue;
+          if (content.length > MAX_CHARS_PER_FILE) {
+            content = content.substring(0, MAX_CHARS_PER_FILE) + '\n... (truncated)';
+          }
+          loaded.push(`── ${file} ──\n${content}`);
+        } catch { /* skip unreadable files */ }
+      }
+
+      if (!loaded.length) return '';
+
+      const normDir = dir.replace(/\\/g, '/');
+      return `
+═══════════════════════════════════════════════════════════════════
+YOUR PERSONAL SKILLS (self-created — these persist across sessions):
+═══════════════════════════════════════════════════════════════════
+These are skill files YOU created in previous sessions. They represent behaviors,
+patterns, and knowledge you chose to remember. Apply them to your current work.
+
+${loaded.join('\n\n')}
+
+Directory: ${normDir}
+You have ${files.length} personal skill file(s). You can update or create more at any time.
+═══════════════════════════════════════════════════════════════════
+`;
+    } catch { return ''; }
   }
 
   /** Build skills context for the employee prompt — includes assigned skills + local Claude Code slash commands */

@@ -16,6 +16,7 @@ import telegramRoutes from './routes/telegram.routes';
 import infrastructureRoutes from './routes/infrastructure.routes';
 import settingsRoutes from './routes/settings.routes';
 import bruceTodoRoutes from './routes/bruce-todo.routes';
+import obsidianSyncRoutes from './routes/obsidian-sync.routes';
 
 const app = express();
 
@@ -41,6 +42,7 @@ app.use('/api/telegram', telegramRoutes);
 app.use('/api/infrastructure', infrastructureRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/bruce-todos', bruceTodoRoutes);
+app.use('/api/obsidian-sync', obsidianSyncRoutes);
 
 // Health check
 app.get('/api/health', (_req, res) => {

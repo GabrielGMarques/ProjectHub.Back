@@ -11,4 +11,5 @@ export const config = {
     callbackUrl: process.env.GITHUB_CALLBACK_URL || 'http://localhost:3777/api/auth/github/callback',
   },
   frontendUrl: process.env.FRONTEND_URL || 'http://localhost:4567',
+  obsidianVaultPath: process.env.OBSIDIAN_VAULT_PATH || '',
 };

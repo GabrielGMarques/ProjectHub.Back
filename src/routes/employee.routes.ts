@@ -92,6 +92,7 @@ router.put('/role-skills/:role', (req: any, res: any) => controller.setRoleSkill
 
 // Employee-specific
 router.get('/:id', (req: any, res: any) => controller.getById(req, res));
+router.patch('/:id/prompt', (req: any, res: any) => controller.updatePrompt(req, res));
 router.delete('/:id', (req: any, res: any) => controller.fire(req, res));
 router.post('/:id/task', (req: any, res: any) => controller.assignTask(req, res));
 router.post('/:id/stop', (req: any, res: any) => controller.stopTask(req, res));

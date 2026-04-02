@@ -18,6 +18,7 @@ import { InfrastructureService } from '../services/infrastructure.service';
 import { ManagerInbox } from '../models/manager-inbox.model';
 import { modelRoutingService } from '../services/model-routing.service';
 import { ModelTier } from '../models/model-routing.model';
+import { obsidianSyncService } from '../services/obsidian-sync.service';
 
 const infraService = new InfrastructureService();
 
@@ -65,6 +66,20 @@ export class EmployeeController {
     const employee = await employeeService.getById(req.userId!, req.params.id);
     if (!employee) { res.status(404).json({ error: 'Employee not found' }); return; }
     res.json(employee);
+  }
+
+  async updatePrompt(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const { systemPrompt } = req.body;
+      if (typeof systemPrompt !== 'string') { res.status(400).json({ error: 'systemPrompt is required' }); return; }
+      const employee = await Employee.findOne({ _id: req.params.id, userId: req.userId });
+      if (!employee) { res.status(404).json({ error: 'Employee not found' }); return; }
+      employee.systemPrompt = systemPrompt;                                                                                                                                                                                                                     
+      await employee.save();
+      res.json(employee);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message });
+    }
   }
 
   async assignTask(req: AuthRequest, res: Response): Promise<void> {
@@ -480,6 +495,9 @@ export class EmployeeController {
       // Wake Alfred so he processes the completion immediately
       managerService.onEmployeeEvent(emp.name, 'task_done');
 
+      // Schedule Obsidian vault sync (debounced)
+      obsidianSyncService.scheduleSync(emp.userId.toString());
+
       res.json({
         message: `Task marked done: ${task.description}`,
         status: emp.status,
@@ -585,6 +603,9 @@ export class EmployeeController {
 
       // Wake Alfred — idle transitions are high-priority, regular updates are informational
       managerService.onEmployeeEvent(emp.name, emp.status === 'idle' ? 'idle' : 'status_update');
+
+      // Schedule Obsidian vault sync (debounced)
+      obsidianSyncService.scheduleSync(emp.userId.toString());
 
       res.json({
         message: 'Working status updated',
