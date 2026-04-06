@@ -48,6 +48,11 @@ export interface IEmployee extends Document {
   lastAssignedAt?: Date;
   taskHistory: IEmployeeTask[];
   hiredAt: Date;
+  /** Heartbeat — opt-in periodic self-check / recurring task */
+  heartbeatEnabled: boolean;
+  heartbeatIntervalMs: number;
+  heartbeatPrompt: string;
+  lastHeartbeatAt?: Date;
 }
 
 const employeeSchema = new Schema<IEmployee>(
@@ -85,6 +90,10 @@ const employeeSchema = new Schema<IEmployee>(
       completedAt: Date,
     }],
     hiredAt: { type: Date, default: Date.now },
+    heartbeatEnabled: { type: Boolean, default: false },
+    heartbeatIntervalMs: { type: Number, default: 3 * 60 * 60 * 1000 },
+    heartbeatPrompt: { type: String, default: '' },
+    lastHeartbeatAt: { type: Date },
   },
   { timestamps: true }
 );

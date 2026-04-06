@@ -23,13 +23,23 @@ export class EmployeeMemoryService {
     return EmployeeMemory.find(filter).sort({ importance: -1, createdAt: -1 }).limit(limit).lean();
   }
 
-  /** Build a compact context string from employee memories for prompt injection */
-  async buildMemoryContext(employeeId: string, limit = 5): Promise<string> {
-    const memories = await EmployeeMemory.find({ employeeId: new Types.ObjectId(employeeId) })
+  /** Build a compact context string from employee memories for prompt injection.
+   * Injects ALL learning memories (no cap) and top N for other categories. */
+  async buildMemoryContext(employeeId: string, limit = 7): Promise<string> {
+    const empObjectId = new Types.ObjectId(employeeId);
+
+    // All learnings — no cap
+    const learnings = await EmployeeMemory.find({ employeeId: empObjectId, category: 'learning' })
+      .sort({ importance: -1, createdAt: -1 })
+      .lean();
+
+    // Top N for everything else
+    const others = await EmployeeMemory.find({ employeeId: empObjectId, category: { $ne: 'learning' } })
       .sort({ importance: -1, createdAt: -1 })
       .limit(limit)
       .lean();
 
+    const memories = [...learnings, ...others];
     if (!memories.length) return '';
 
     // Mark as accessed

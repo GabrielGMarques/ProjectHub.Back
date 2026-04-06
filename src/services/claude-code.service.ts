@@ -41,8 +41,6 @@ export interface RunCommandResult {
   tokenUsage?: TokenUsageData;
 }
 
-const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
-
 // Lazy-load the ESM-only SDK from CommonJS
 // Use Function constructor to prevent ts-node from transpiling import() into require()
 const dynamicImport = new Function('specifier', 'return import(specifier)') as (s: string) => Promise<any>;
@@ -61,7 +59,6 @@ export class ClaudeCodeService {
   // Static so all instances share the same session tracking
   private static activeSessions: Map<string, { close: () => void; sdkSessionId?: string; projectId?: string; startedAt: Date }> = new Map();
   private static pendingMessages: Map<string, string[]> = new Map();
-  private cleanupInterval: ReturnType<typeof setInterval> | null = null;
 
   async checkAvailability(): Promise<{ available: boolean; version: string }> {
     // SDK uses Claude Code OAuth subscription, not ANTHROPIC_API_KEY
@@ -81,7 +78,7 @@ export class ClaudeCodeService {
     prompt: string,
     onEvent: (event: ClaudeCodeEvent) => void,
     options?: { resumeSdkSessionId?: string; allowedTools?: string[]; keepAlive?: boolean; mcpServers?: Record<string, any>; model?: string; shouldContinue?: () => Promise<boolean> },
-    timeoutMs: number = DEFAULT_TIMEOUT_MS
+    timeoutMs?: number
   ): Promise<RunCommandResult> {
     // Validate project path — normalize to forward slashes for the SDK
     const resolvedPath = path.resolve(projectPath).replace(/\\/g, '/');
@@ -108,8 +105,8 @@ export class ClaudeCodeService {
     // Initialize pending messages queue for this session
     ClaudeCodeService.pendingMessages.set(sessionId, []);
 
-    // Timeout guard
-    const timer = setTimeout(() => {
+    // Timeout guard — only armed when caller passes an explicit timeoutMs
+    const timer = timeoutMs ? setTimeout(() => {
       const event: ClaudeCodeEvent = {
         type: 'error',
         content: `Session timed out after ${timeoutMs / 1000}s`,
@@ -119,7 +116,7 @@ export class ClaudeCodeService {
       collectedEvents.push(event);
       onEvent(event);
       this.cancelSession(sessionId);
-    }, timeoutMs);
+    }, timeoutMs) : null;
 
     const startEvent: ClaudeCodeEvent = { type: 'start', sessionId, timestamp: new Date() };
     collectedEvents.push(startEvent);
@@ -329,7 +326,7 @@ export class ClaudeCodeService {
         break; // Normal completion or no keep-alive, exit loop
       }
     } finally {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       if (stuckInterval) clearInterval(stuckInterval);
       ClaudeCodeService.activeSessions.delete(sessionId);
       ClaudeCodeService.pendingMessages.delete(sessionId);
@@ -451,29 +448,6 @@ export class ClaudeCodeService {
       return result.modifiedCount || 0;
     } catch {
       return 0;
-    }
-  }
-
-  /** Start periodic cleanup of timed-out sessions */
-  startCleanupRoutine(intervalMs: number = 5 * 60 * 1000): void {
-    if (this.cleanupInterval) return;
-    this.cleanupInterval = setInterval(() => {
-      const now = Date.now();
-      for (const [sessionId, session] of ClaudeCodeService.activeSessions) {
-        const elapsed = now - session.startedAt.getTime();
-        if (elapsed > DEFAULT_TIMEOUT_MS) {
-          console.log(`[ClaudeCode] Stopping timed-out session: ${sessionId}`);
-          try { session.close(); } catch {}
-          ClaudeCodeService.activeSessions.delete(sessionId);
-        }
-      }
-    }, intervalMs);
-  }
-
-  stopCleanupRoutine(): void {
-    if (this.cleanupInterval) {
-      clearInterval(this.cleanupInterval);
-      this.cleanupInterval = null;
     }
   }
 

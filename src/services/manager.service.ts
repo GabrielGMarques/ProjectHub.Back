@@ -967,7 +967,7 @@ List Bruce's open todos (read action — results come back to you).
 \`\`\`
 
 \`\`\`manager-action
-{"action": "update_project", "projectId": "<id>", "field": "description|niche|impact|mrr|presentation|monetizationPlan", "value": "new value"}
+{"action": "update_project", "projectId": "<id>", "field": "description|niche|impact|mrr|presentation|monetizationPlan|folders", "value": "new value (for folders: comma-separated paths or JSON array)"}
 \`\`\`
 
 \`\`\`manager-action
@@ -975,7 +975,11 @@ List Bruce's open todos (read action — results come back to you).
 \`\`\`
 
 \`\`\`manager-action
-{"action": "create_project", "name": "Company Name", "description": "description"}
+{"action": "create_project", "name": "Company Name", "description": "description", "folders": ["D:/path/to/project"]}
+\`\`\`
+
+\`\`\`manager-action
+{"action": "set_heartbeat", "employeeId": "<id>", "enabled": true, "intervalMinutes": 180, "prompt": "Check the status of all running services and report any anomalies"}
 \`\`\`
 
 \`\`\`manager-action
@@ -1136,6 +1140,12 @@ RULES:
   - Any action that changes business direction, strategy, or priorities.
   - When in doubt, ask: "Bruce, I'd like to put [name] on [task] for [company]. Good to go?"
 - For tasks: employee MUST be "idle" and company MUST have folders.
+- **COMPANY WORKSPACE SETUP**: When creating a new company or when a company has no folders:
+  1. Create the local folder on disk using create_project with folders, or update_project with field "folders".
+  2. The standard workspace root is D:/GrowthMaster/Repos/ — create company folders there (e.g. D:/GrowthMaster/Repos/CompanyName).
+  3. The folder will be auto-created on disk if it doesn't exist — no need to mkdir separately.
+  4. A company CANNOT have employees assigned tasks until it has at least one folder configured.
+  5. When Bruce asks to set up a new company/project, ALWAYS create the workspace folder as part of setup.
 - Use IDs from the context above.
 - You can include multiple actions in one response.
 - To understand what an employee did — USE THIS ORDER:
@@ -1565,6 +1575,18 @@ RULES:
         const update: any = {};
         if (['mrr', 'clientCount'].includes(action.field)) {
           update[action.field] = Number(action.value) || 0;
+        } else if (action.field === 'folders') {
+          // Accept comma-separated string, JSON array string, or already an array
+          let folders = action.value;
+          if (typeof folders === 'string') {
+            try { folders = JSON.parse(folders); } catch { folders = folders.split(',').map((f: string) => f.trim()); }
+          }
+          if (!Array.isArray(folders)) folders = [folders];
+          // Create directories if they don't exist
+          for (const f of folders) {
+            if (f && !fs.existsSync(f)) fs.mkdirSync(f, { recursive: true });
+          }
+          update.folders = folders;
         } else {
           update[action.field] = action.value;
         }
@@ -1573,8 +1595,32 @@ RULES:
         return `Updated ${action.field} on ${updated.name}`;
       }
       case 'create_project': {
-        const p = await projectService.create(userId, { name: action.name, description: action.description || '' });
-        return `Created company: ${p.name}`;
+        const createData: any = { name: action.name, description: action.description || '' };
+        // Support setting folders at creation time
+        if (action.folders) {
+          const folders = Array.isArray(action.folders) ? action.folders : [action.folders];
+          for (const f of folders) {
+            if (f && !fs.existsSync(f)) fs.mkdirSync(f, { recursive: true });
+          }
+          createData.folders = folders;
+        }
+        const p = await projectService.create(userId, createData);
+        return `Created company: ${p.name}${createData.folders ? ` with folder(s): ${createData.folders.join(', ')}` : ''}`;
+      }
+      case 'set_heartbeat': {
+        if (!action.employeeId) throw new Error('employeeId required');
+        const emp = await Employee.findOne({ _id: action.employeeId, userId });
+        if (!emp) throw new Error('Employee not found');
+        if (typeof action.enabled === 'boolean') emp.heartbeatEnabled = action.enabled;
+        if (typeof action.intervalMinutes === 'number' && action.intervalMinutes >= 1) {
+          emp.heartbeatIntervalMs = action.intervalMinutes * 60 * 1000;
+        }
+        if (typeof action.prompt === 'string') emp.heartbeatPrompt = action.prompt.substring(0, 5000);
+        await emp.save();
+        const state = emp.heartbeatEnabled
+          ? `enabled (every ${Math.round(emp.heartbeatIntervalMs / 60000)}min)`
+          : 'disabled';
+        return `Heartbeat for ${emp.name}: ${state}`;
       }
       case 'list_files': {
         return this.listFiles(action.projectId, userId, action.path);

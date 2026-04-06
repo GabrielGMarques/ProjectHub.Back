@@ -135,8 +135,16 @@ async function doQuery(opts: ProxyOptions): Promise<string> {
   });
 
   let result = '';
+  let resultMsgInfo: { subtype?: string; isError?: boolean; hasResult?: boolean } | null = null;
+  const seenTypes: string[] = [];
   for await (const message of conversation) {
+    seenTypes.push(message.type + (message.subtype ? `:${message.subtype}` : ''));
     if (message.type === 'result') {
+      resultMsgInfo = {
+        subtype: message.subtype,
+        isError: message.is_error,
+        hasResult: !!message.result,
+      };
       if (message.result) result = message.result;
       // Capture usage
       if (message.usage) {
@@ -162,7 +170,17 @@ async function doQuery(opts: ProxyOptions): Promise<string> {
     }
   }
 
-  console.log(`[${new Date().toISOString().replace('T', ' ').substring(0, 19)}] [ClaudeProxy] doQuery: completed in ${((Date.now() - queryStart) / 1000).toFixed(1)}s, result=${result.length} chars${_lastUsage ? `, ${_lastUsage.inputTokens} in / ${_lastUsage.outputTokens} out` : ''}`);
+  const ts = new Date().toISOString().replace('T', ' ').substring(0, 19);
+  console.log(`[${ts}] [ClaudeProxy] doQuery: completed in ${((Date.now() - queryStart) / 1000).toFixed(1)}s, result=${result.length} chars${_lastUsage ? `, ${_lastUsage.inputTokens} in / ${_lastUsage.outputTokens} out` : ''}`);
+
+  // Diagnostic: when result is empty, log the message stream so we can tell rate-limit from auth from max-turns
+  if (!result) {
+    console.error(`[${ts}] [ClaudeProxy] EMPTY RESULT — messages seen: [${seenTypes.join(', ')}], resultMsg=${JSON.stringify(resultMsgInfo)}, usage=${JSON.stringify(_lastUsage)}`);
+    // Surface the SDK's actual error subtype so callers (and retry logic) can react
+    if (resultMsgInfo?.isError || resultMsgInfo?.subtype?.startsWith('error_')) {
+      throw new Error(`Claude SDK error: ${resultMsgInfo.subtype || 'unknown'}`);
+    }
+  }
   return result;
 }
 

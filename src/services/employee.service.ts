@@ -457,7 +457,7 @@ export class EmployeeService {
     // Build skills context — employee's assigned skills + discovered local Claude Code skills
     const skillsCtx = this.buildSkillsContext(employee, cwd);
     const personalSkillsCtx = this.buildPersonalSkillsContext(employee, cwd);
-    const memoryCtx = await employeeMemoryService.buildMemoryContext(employee._id.toString(), 5);
+    const memoryCtx = await employeeMemoryService.buildMemoryContext(employee._id.toString(), 7);
 
     // Fetch recent working status history so employee can pick up context without resuming old sessions
     const recentStatuses = await WorkingStatusHistory.find({ employeeId: employee._id })

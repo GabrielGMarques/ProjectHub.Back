@@ -4,6 +4,7 @@ import { execSync } from 'child_process';
 import { Project } from '../models/project.model';
 import { Employee } from '../models/employee.model';
 import { WorkingStatusHistory } from '../models/working-status-history.model';
+import { EmployeeMemory } from '../models/employee-memory.model';
 import { config } from '../config';
 import { TelemetryService } from './telemetry.service';
 
@@ -42,6 +43,10 @@ function yamlEscape(value: string): string {
 
 function formatDate(d: Date): string {
   return new Date(d).toISOString().replace('T', ' ').substring(0, 16);
+}
+
+function projectLabel(project: any): string {
+  return `[[${project.name}]]`;
 }
 
 function taskStatusIcon(status: string): string {
@@ -158,9 +163,14 @@ export class ObsidianSyncService {
         );
 
         // Employee pages
+        fs.mkdirSync(path.join(projDir, 'learnings'), { recursive: true });
         for (const emp of employees) {
           const statusHistory: any[] = await WorkingStatusHistory.find({ employeeId: emp._id })
             .sort({ createdAt: -1 })
+            .lean();
+
+          const learnings: any[] = await EmployeeMemory.find({ employeeId: emp._id, category: 'learning' })
+            .sort({ importance: -1, createdAt: -1 })
             .lean();
 
           const taskCount = emp.taskHistory?.length || 0;
@@ -169,12 +179,23 @@ export class ObsidianSyncService {
 
           const empId = String(emp._id).slice(-6);
           const empFileName = slugify(`${emp.name} - ${empId}`);
+          const learningsFileName = slugify(`${emp.name} - ${empId} - learnings`);
+
           fs.writeFileSync(
             path.join(projDir, 'employees', `${empFileName}.md`),
-            this.generateEmployeePage(emp, project, statusHistory),
+            this.generateEmployeePage(emp, project, statusHistory, learnings.length, learningsFileName),
             'utf-8',
           );
-          console.log(`${LOG_PREFIX}   ↳ ${emp.avatar} ${emp.name}: ${statusHistory.length} status entries, ${taskCount} tasks`);
+
+          if (learnings.length > 0) {
+            fs.writeFileSync(
+              path.join(projDir, 'learnings', `${learningsFileName}.md`),
+              this.generateLearningsPage(emp, project, learnings, empFileName),
+              'utf-8',
+            );
+          }
+
+          console.log(`${LOG_PREFIX}   ↳ ${emp.avatar} ${emp.name}: ${statusHistory.length} status entries, ${taskCount} tasks, ${learnings.length} learnings`);
           employeesSynced++;
         }
 
@@ -192,6 +213,13 @@ export class ObsidianSyncService {
             continue;
           }
 
+          // Generate / update CLAUDE.md for this project folder
+          try {
+            this.writeClaudeMd(normFolder, project, employees);
+          } catch (err: any) {
+            console.warn(`${LOG_PREFIX}   ⚠ CLAUDE.md write failed: ${err.message}`);
+          }
+
           // Sync .agents/ subdirectories
           const agentsDir = path.join(normFolder, '.agents');
           if (fs.existsSync(agentsDir)) {
@@ -199,13 +227,13 @@ export class ObsidianSyncService {
               const srcSub = path.join(agentsDir, subDir);
               if (!fs.existsSync(srcSub)) continue;
               const destSub = path.join(projDir, 'agents', subDir);
-              const copied = this.copyMdFiles(srcSub, destSub, opts.full, employees);
+              const copied = this.copyMdFiles(srcSub, destSub, opts.full, employees, projectLabel(project));
               projectFilesCopied += copied;
             }
           }
 
           // Sync root-level and other .md files into docs/
-          projectFilesCopied += this.copyRootMdFiles(normFolder, projDir, opts.full, employees);
+          projectFilesCopied += this.copyRootMdFiles(normFolder, projDir, opts.full, employees, projectLabel(project));
         }
 
         filesCopied += projectFilesCopied;
@@ -279,8 +307,9 @@ synced: ${now}
 `;
 
     for (const p of projects) {
+      const label = projectLabel(p);
       const status = p.onHolding ? '⏸️ On Hold' : '▶️ Active';
-      md += `- [[_project - ${slugify(p.name)}|${p.name}]] — ${status}`;
+      md += `- [[_project - ${slugify(p.name)}|${label}]] — ${status}`;
       if (p.description) md += ` — ${p.description.substring(0, 100)}`;
       md += '\n';
     }
@@ -290,14 +319,17 @@ synced: ${now}
 
   private generateProjectPage(project: any, employees: any[]): string {
     const now = new Date().toISOString();
+    const label = projectLabel(project);
+    const projId = String(project._id).slice(-6);
     let md = `---
 type: project
 name: ${yamlEscape(project.name)}
+projectId: ${projId}
 status: ${project.onHolding ? 'on-hold' : 'active'}
 synced: ${now}
 ---
 
-# ${project.name}
+# ${label}
 
 `;
 
@@ -318,29 +350,32 @@ synced: ${now}
     for (const emp of employees) {
       const empId = String(emp._id).slice(-6);
       const empFile = slugify(`${emp.name} - ${empId}`);
-      md += `- ${emp.avatar} [[${empFile}|${emp.name} (${empId})]] — ${emp.title} — ${emp.status}\n`;
+      md += `- ${emp.avatar} [[${emp.name}]] — ${emp.title} — ${emp.status}\n`;
     }
 
     return md;
   }
 
-  private generateEmployeePage(employee: any, project: any, statusHistory: any[]): string {
+  private generateEmployeePage(employee: any, project: any, statusHistory: any[], learningsCount = 0, learningsFileName = ''): string {
     const now = new Date().toISOString();
+    const label = projectLabel(project);
+    const empId = String(employee._id).slice(-6);
 
     let md = `---
 type: employee
-project: ${yamlEscape(project.name)}
+project: ${yamlEscape(label)}
 name: ${yamlEscape(employee.name)}
+employeeId: ${empId}
 role: ${yamlEscape(employee.role)}
 title: ${yamlEscape(employee.title)}
 status: ${employee.status}
 ${employee.lastActivity ? `lastActivity: ${new Date(employee.lastActivity).toISOString()}\n` : ''}synced: ${now}
 ---
 
-# ${employee.avatar} ${employee.name} — ${employee.title}
+# ${employee.avatar} [[${employee.name}]] — ${employee.title}
 
-**Status:** ${employee.status} | **Project:** [[_project - ${slugify(project.name)}|${project.name}]]
-
+**Status:** ${employee.status} | **Project:** [[_project - ${slugify(project.name)}|${label}]]
+${learningsCount > 0 ? `\n📘 **Learnings:** [[${learningsFileName}|${learningsCount} accumulated learnings]]\n` : ''}
 `;
 
     // Current task
@@ -365,8 +400,8 @@ ${employee.lastActivity ? `lastActivity: ${new Date(employee.lastActivity).toISO
       md += `## Status History\n`;
       for (const entry of statusHistory) {
         md += `### ${formatDate(new Date(entry.createdAt))} (${entry.source})\n`;
-        md += `- **Project:** ${project.name}\n`;
-        md += `- **Employee:** ${employee.avatar} ${employee.name} (${employee.title})\n`;
+        md += `- **Project:** ${projectLabel(project)}\n`;
+        md += `- **Employee:** ${employee.avatar} [[${employee.name}]] — ${employee.title}\n`;
         if (entry.taskId) {
           const task = taskMap.get(entry.taskId);
           md += `- **Task:** ${task?.description || entry.taskId}\n`;
@@ -398,6 +433,101 @@ ${employee.lastActivity ? `lastActivity: ${new Date(employee.lastActivity).toISO
     return md;
   }
 
+  private generateLearningsPage(employee: any, project: any, learnings: any[], empFileName: string): string {
+    const now = new Date().toISOString();
+    const label = projectLabel(project);
+    const empId = String(employee._id).slice(-6);
+
+    let md = `---
+type: learnings
+project: ${yamlEscape(label)}
+employee: ${yamlEscape(employee.name)}
+employeeId: ${empId}
+role: ${yamlEscape(employee.role)}
+count: ${learnings.length}
+synced: ${now}
+---
+
+# 📘 Learnings — ${employee.avatar} [[${empFileName}|${employee.name}]]
+
+**Project:** [[_project - ${slugify(project.name)}|${label}]]
+**Total learnings:** ${learnings.length}
+
+`;
+
+    for (const learning of learnings) {
+      md += `### imp ${learning.importance} — ${formatDate(new Date(learning.createdAt))}\n`;
+      md += `${learning.content}\n`;
+      if (learning.tags?.length) {
+        md += `\n*Tags:* ${learning.tags.map((t: string) => `#${t}`).join(' ')}\n`;
+      }
+      md += '\n---\n\n';
+    }
+
+    return md;
+  }
+
+  /**
+   * Write or update CLAUDE.md in the project folder so Claude Code sessions
+   * automatically get full project context (description, team, available skills).
+   * Preserves any user-added content below the AUTO-GENERATED markers.
+   */
+  private writeClaudeMd(projectFolder: string, project: any, employees: any[]): void {
+    const claudeMdPath = path.join(projectFolder, 'CLAUDE.md');
+    const projId = String(project._id).slice(-6);
+    const now = new Date().toISOString();
+
+    const START = '<!-- AUTO-GENERATED:START — managed by ProjectsHub obsidian-sync -->';
+    const END = '<!-- AUTO-GENERATED:END -->';
+
+    let teamSection = '';
+    if (employees.length > 0) {
+      teamSection = `\n## Team (${employees.length})\n\n`;
+      teamSection += `| Employee | ID | Role | Status | Last Activity |\n`;
+      teamSection += `|----------|----|----|--------|---------------|\n`;
+      for (const emp of employees) {
+        const empId = String(emp._id).slice(-6);
+        const lastActivity = emp.lastActivity
+          ? new Date(emp.lastActivity).toISOString().substring(0, 10)
+          : '—';
+        teamSection += `| ${emp.avatar} ${emp.name} | \`${empId}\` | ${emp.role} | ${emp.status} | ${lastActivity} |\n`;
+      }
+    }
+
+    const generated = `${START}
+<!-- Last sync: ${now} -->
+
+# ${project.name} \`${projId}\`
+
+${project.description || '_(no description)_'}
+
+${project.strategicDirection ? `## Strategic Direction\n${project.strategicDirection.substring(0, 2000)}\n` : ''}
+${project.applications?.length ? `## Applications\n${project.applications.map((a: any) => `- **${a.name}** (${a.type}) — port ${a.port} — ${a.status}`).join('\n')}\n` : ''}${teamSection}
+${END}
+`;
+
+    let finalContent: string;
+    if (fs.existsSync(claudeMdPath)) {
+      const existing = fs.readFileSync(claudeMdPath, 'utf-8');
+      const startIdx = existing.indexOf(START);
+      const endIdx = existing.indexOf(END);
+
+      if (startIdx !== -1 && endIdx !== -1) {
+        // Replace existing auto-generated block, preserve everything else
+        const before = existing.substring(0, startIdx);
+        const after = existing.substring(endIdx + END.length);
+        finalContent = before + generated.trim() + after;
+      } else {
+        // No markers — prepend the auto-generated block
+        finalContent = generated + '\n' + existing;
+      }
+    } else {
+      finalContent = generated;
+    }
+
+    fs.writeFileSync(claudeMdPath, finalContent, 'utf-8');
+  }
+
   // ── File operations ──
 
   /**
@@ -408,7 +538,7 @@ ${employee.lastActivity ? `lastActivity: ${new Date(employee.lastActivity).toISO
     const map = new Map<string, string>();
     for (const emp of employees) {
       const empId = String(emp._id).slice(-6);
-      const label = `${emp.name} (${empId})`;
+      const label = `[[${emp.name}]]`;
       // Map various forms of the role name to the enriched label
       map.set(emp.name.toLowerCase(), label);
       map.set(emp.title.toLowerCase(), label);
@@ -421,7 +551,7 @@ ${employee.lastActivity ? `lastActivity: ${new Date(employee.lastActivity).toISO
    * Replace all role name references in markdown content with enriched employee IDs.
    * Handles: Author:, Role:, From:, "Message from X → Y", title lines with role names.
    */
-  private enrichAuthorReferences(content: string, authorMap: Map<string, string>): string {
+  private enrichFileContent(content: string, authorMap: Map<string, string>, projectName: string, fileMtime: Date): string {
     // Helper: replace a role name if found in the map
     const replaceRole = (name: string): string => {
       const lookup = name.trim().toLowerCase();
@@ -446,10 +576,33 @@ ${employee.lastActivity ? `lastActivity: ${new Date(employee.lastActivity).toISO
       (_match, hashes, name, suffix) => `${hashes}${replaceRole(name)} ${suffix}`,
     );
 
+    // 4. Enrich **Date:** lines — add time if missing, and inject **Project:** after it
+    content = content.replace(
+      /^(\*{0,2}Date\*{0,2}:\s*\*{0,2})(\d{4}-\d{2}-\d{2})(\*{0,2}\s*)$/gim,
+      (_match, prefix, date, suffix) => `${prefix}${date} ${fileMtime.toISOString().substring(11, 16)}${suffix}`,
+    );
+    // Also handle dates without ISO format (e.g. "18 de Março de 2026") — leave as-is but still inject project
+    // Inject **Project:** after the **Date:** line if not already present
+    if (!content.match(/^\*{0,2}Project\*{0,2}:/im)) {
+      const dateInjected = content.replace(
+        /^(\*{0,2}Date\*{0,2}:.*$)/im,
+        `$1\n**Project:** ${projectName}`,
+      );
+      if (dateInjected !== content) {
+        content = dateInjected;
+      } else {
+        // No Date: line found — inject after first heading
+        content = content.replace(
+          /^(#{1,3}\s+.+)$/m,
+          `$1\n\n**Project:** ${projectName}`,
+        );
+      }
+    }
+
     return content;
   }
 
-  private copyMdFiles(srcDir: string, destDir: string, full?: boolean, employees?: any[]): number {
+  private copyMdFiles(srcDir: string, destDir: string, full?: boolean, employees?: any[], projectName?: string): number {
     fs.mkdirSync(destDir, { recursive: true });
     const authorMap = employees ? this.buildAuthorMap(employees) : new Map();
     let count = 0;
@@ -462,16 +615,16 @@ ${employee.lastActivity ? `lastActivity: ${new Date(employee.lastActivity).toISO
       const dest = path.join(destDir, rel);
       fs.mkdirSync(path.dirname(dest), { recursive: true });
 
+      const srcStat = fs.statSync(filePath);
       if (!full && fs.existsSync(dest)) {
-        const srcMtime = fs.statSync(filePath).mtimeMs;
         const destMtime = fs.statSync(dest).mtimeMs;
-        if (srcMtime <= destMtime) continue;
+        if (srcStat.mtimeMs <= destMtime) continue;
       }
 
-      if (filePath.endsWith('.md') && authorMap.size > 0) {
+      if (filePath.endsWith('.md') && (authorMap.size > 0 || projectName)) {
         try {
           const content = fs.readFileSync(filePath, 'utf-8');
-          const enriched = this.enrichAuthorReferences(content, authorMap);
+          const enriched = this.enrichFileContent(content, authorMap, projectName || '', srcStat.mtime);
           fs.writeFileSync(dest, enriched, 'utf-8');
         } catch {
           fs.copyFileSync(filePath, dest);
@@ -485,7 +638,7 @@ ${employee.lastActivity ? `lastActivity: ${new Date(employee.lastActivity).toISO
     return count;
   }
 
-  private copyRootMdFiles(projectFolder: string, vaultProjDir: string, full?: boolean, employees?: any[]): number {
+  private copyRootMdFiles(projectFolder: string, vaultProjDir: string, full?: boolean, employees?: any[], projectName?: string): number {
     let count = 0;
     const docsDir = path.join(vaultProjDir, 'docs');
     fs.mkdirSync(docsDir, { recursive: true });
@@ -501,16 +654,16 @@ ${employee.lastActivity ? `lastActivity: ${new Date(employee.lastActivity).toISO
         const src = path.join(projectFolder, entry.name);
         const dest = path.join(docsDir, entry.name);
 
+        const srcStat = fs.statSync(src);
         if (!full && fs.existsSync(dest)) {
-          const srcMtime = fs.statSync(src).mtimeMs;
           const destMtime = fs.statSync(dest).mtimeMs;
-          if (srcMtime <= destMtime) continue;
+          if (srcStat.mtimeMs <= destMtime) continue;
         }
 
-        if (authorMap.size > 0) {
+        if (authorMap.size > 0 || projectName) {
           try {
             const content = fs.readFileSync(src, 'utf-8');
-            const enriched = this.enrichAuthorReferences(content, authorMap);
+            const enriched = this.enrichFileContent(content, authorMap, projectName || '', srcStat.mtime);
             fs.writeFileSync(dest, enriched, 'utf-8');
           } catch {
             fs.copyFileSync(src, dest);

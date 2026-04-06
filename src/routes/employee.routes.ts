@@ -97,6 +97,10 @@ router.delete('/:id', (req: any, res: any) => controller.fire(req, res));
 router.post('/:id/task', (req: any, res: any) => controller.assignTask(req, res));
 router.post('/:id/stop', (req: any, res: any) => controller.stopTask(req, res));
 router.post('/:id/message', (req: any, res: any) => controller.sendMessage(req, res));
+
+// Heartbeat — periodic recurring task config
+router.get('/:id/heartbeat', (req: any, res: any) => controller.getHeartbeat(req, res));
+router.put('/:id/heartbeat', (req: any, res: any) => controller.updateHeartbeat(req, res));
 router.get('/:id/logs', (req: any, res: any) => controller.getLogs(req, res));
 router.get('/:id/status-history', (req: any, res: any) => controller.getStatusHistory(req, res));
 router.post('/:id/skills', (req: any, res: any) => controller.addSkill(req, res));

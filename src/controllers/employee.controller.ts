@@ -834,4 +834,47 @@ ${currentTask.description}`;
       res.status(500).json({ error: err.message });
     }
   }
+
+  /** GET /employees/:id/heartbeat — read heartbeat config */
+  async getHeartbeat(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const emp = await Employee.findOne({ _id: req.params.id, userId: req.userId }).lean();
+      if (!emp) { res.status(404).json({ error: 'Employee not found' }); return; }
+      res.json({
+        enabled: emp.heartbeatEnabled || false,
+        intervalMs: emp.heartbeatIntervalMs || (3 * 60 * 60 * 1000),
+        prompt: emp.heartbeatPrompt || '',
+        lastHeartbeatAt: emp.lastHeartbeatAt || null,
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+
+  /** PUT /employees/:id/heartbeat — update heartbeat config (any subset of fields) */
+  async updateHeartbeat(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const { enabled, intervalMs, prompt } = req.body || {};
+      const update: any = {};
+      if (typeof enabled === 'boolean') update.heartbeatEnabled = enabled;
+      if (typeof intervalMs === 'number' && intervalMs >= 60_000) update.heartbeatIntervalMs = intervalMs;
+      if (typeof prompt === 'string') update.heartbeatPrompt = prompt.substring(0, 5000);
+
+      const emp = await Employee.findOneAndUpdate(
+        { _id: req.params.id, userId: req.userId },
+        update,
+        { new: true },
+      );
+      if (!emp) { res.status(404).json({ error: 'Employee not found' }); return; }
+
+      res.json({
+        enabled: emp.heartbeatEnabled,
+        intervalMs: emp.heartbeatIntervalMs,
+        prompt: emp.heartbeatPrompt,
+        lastHeartbeatAt: emp.lastHeartbeatAt,
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  }
 }

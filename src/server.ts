@@ -9,6 +9,7 @@ import { User } from './models/user.model';
 import { Project } from './models/project.model';
 import { Employee } from './models/employee.model';
 import { managerService } from './services/manager.service';
+import { heartbeatService } from './services/heartbeat.service';
 
 const claudeCodeService = new ClaudeCodeService();
 const telegramService = telegramBot;
@@ -38,9 +39,6 @@ async function startServer(): Promise<void> {
   if (cleaned > 0) {
     console.log(`[Startup] Cleaned up ${cleaned} stale agent sessions`);
   }
-
-  // Start periodic cleanup of timed-out sessions
-  claudeCodeService.startCleanupRoutine();
 
   // Telegram bot — always register command handler so setup screen can start polling later
   {
@@ -172,6 +170,9 @@ async function startServer(): Promise<void> {
   // Start the always-on Manager
   managerService.start();
 
+  // Start the heartbeat scheduler (recurring per-employee tasks)
+  heartbeatService.start();
+
   const server = http.createServer(app);
   wsService.init(server);
   server.listen(config.port, () => {
@@ -183,7 +184,6 @@ async function startServer(): Promise<void> {
     console.log('[Shutdown] Stopping services...');
     const stopped = claudeCodeService.stopAllSessions();
     if (stopped > 0) console.log(`[Shutdown] Stopped ${stopped} sessions`);
-    claudeCodeService.stopCleanupRoutine();
     managerService.stop();
     telegramService.stopPolling();
     server.close(() => process.exit(0));
@@ -192,19 +192,32 @@ async function startServer(): Promise<void> {
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 
-  // Crash recovery — log and exit (nodemon will restart)
-  process.on('uncaughtException', (err) => {
+  // Non-fatal errors that should NOT crash the server
+  const NON_FATAL_ERRORS = new Set(['EPIPE', 'ECONNRESET', 'ECONNABORTED', 'ERR_STREAM_DESTROYED', 'ERR_STREAM_WRITE_AFTER_END']);
+
+  // Crash recovery — log and exit (resilient runner will restart)
+  process.on('uncaughtException', (err: any) => {
+    if (NON_FATAL_ERRORS.has(err.code) || NON_FATAL_ERRORS.has(err.message?.split(':')[0])) {
+      console.warn(`[WARN] Non-fatal error (ignored): ${err.code || err.message}`);
+      return;
+    }
     console.error('[FATAL] Uncaught exception:', err.message);
     console.error(err.stack);
     telegramService.send(`🚨 *Server crashed:* ${err.message.substring(0, 200)}\n_Restarting..._`).catch(() => {});
-    // Give Telegram message time to send, then exit so nodemon restarts
+    // Give Telegram message time to send, then exit so resilient runner restarts
     setTimeout(() => process.exit(1), 2000);
   });
 
   process.on('unhandledRejection', (reason: any) => {
-    console.error('[FATAL] Unhandled rejection:', reason?.message || reason);
+    const msg = reason?.message || String(reason);
+    const code = reason?.code;
+    if (NON_FATAL_ERRORS.has(code) || NON_FATAL_ERRORS.has(msg?.split(':')[0])) {
+      console.warn(`[WARN] Non-fatal rejection (ignored): ${code || msg}`);
+      return;
+    }
+    console.error('[FATAL] Unhandled rejection:', msg);
     if (reason?.stack) console.error(reason.stack);
-    telegramService.send(`🚨 *Unhandled rejection:* ${(reason?.message || String(reason)).substring(0, 200)}\n_Restarting..._`).catch(() => {});
+    telegramService.send(`🚨 *Unhandled rejection:* ${msg.substring(0, 200)}\n_Restarting..._`).catch(() => {});
     setTimeout(() => process.exit(1), 2000);
   });
 }
