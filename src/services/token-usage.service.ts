@@ -1,5 +1,13 @@
 import { TokenUsage } from '../models/token-usage.model';
 
+/**
+ * Historical per-turn rows from employee.service.ts double-count cache reads
+ * because the SDK reports each call's `cache_read_input_tokens` as the cumulative
+ * cached prefix, not a delta. We exclude any row tagged `metadata.turn: true`
+ * from all aggregations so totals reflect actual API consumption.
+ */
+const EXCLUDE_PER_TURN_ROWS = { 'metadata.turn': { $ne: true } } as const;
+
 export class TokenUsageService {
 
   /**
@@ -127,6 +135,7 @@ export class TokenUsageService {
     const records = await TokenUsage.find({
       userId,
       createdAt: { $gte: since },
+      ...EXCLUDE_PER_TURN_ROWS,
     })
       .populate('employeeId', 'name avatar role')
       .lean();
@@ -222,7 +231,7 @@ export class TokenUsageService {
    * Get recent individual usage records.
    */
   async getRecent(userId: string, limit: number = 50): Promise<any[]> {
-    return TokenUsage.find({ userId })
+    return TokenUsage.find({ userId, ...EXCLUDE_PER_TURN_ROWS })
       .sort({ createdAt: -1 })
       .limit(limit)
       .populate('employeeId', 'name avatar role')
@@ -237,7 +246,7 @@ export class TokenUsageService {
     records: any[];
     summary: { totalTokens: number; totalCost: number; totalCalls: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number };
   }> {
-    const records = await TokenUsage.find({ userId, employeeId })
+    const records = await TokenUsage.find({ userId, employeeId, ...EXCLUDE_PER_TURN_ROWS })
       .sort({ createdAt: -1 })
       .limit(limit)
       .populate('projectId', 'name')

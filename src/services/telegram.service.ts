@@ -219,6 +219,12 @@ export class TelegramService {
 
   private processing = false;
   private messageQueue: { text: string; chatId: string }[] = [];
+  private callbackQueryHandler: ((data: string, callbackQueryId: string, messageId: number) => Promise<void>) | null = null;
+
+  /** Register a handler for inline keyboard button presses */
+  setCallbackQueryHandler(handler: (data: string, callbackQueryId: string, messageId: number) => Promise<void>): void {
+    this.callbackQueryHandler = handler;
+  }
 
   private async pollUpdates(): Promise<void> {
     try {
@@ -227,6 +233,25 @@ export class TelegramService {
 
       for (const update of data.result) {
         this.lastUpdateId = update.update_id;
+
+        // Handle callback_query (inline keyboard button presses)
+        if (update.callback_query && this.callbackQueryHandler) {
+          const cb = update.callback_query;
+          const cbChatId = String(cb.message?.chat?.id || '');
+          if (this.chatId && cbChatId !== this.chatId) continue;
+          try {
+            await this.callbackQueryHandler(
+              cb.data || '',
+              cb.id,
+              cb.message?.message_id || 0,
+            );
+          } catch (err: any) {
+            console.error('[Telegram] Callback handler error:', err.message);
+            await this.answerCallbackQuery(cb.id, 'Error processing');
+          }
+          continue;
+        }
+
         const fromChatId = String(update.message?.chat?.id);
 
         // Handle document/photo messages — download and extract text
@@ -678,6 +703,49 @@ export class TelegramService {
   /** Public API get (for validation calls like getMe) */
   apiGetPublic(method: string, params: Record<string, any>): Promise<any> {
     return this.apiGet(method, params);
+  }
+
+  /** Send a message with inline keyboard buttons */
+  async sendWithKeyboard(text: string, buttons: { text: string; callback_data?: string; url?: string }[][]): Promise<boolean> {
+    if (!this.botToken || !this.chatId) return false;
+    const converted = TelegramService.toTelegramMarkdown(text);
+    let result = await this.apiCallWithResponse('sendMessage', {
+      chat_id: this.chatId,
+      text: converted,
+      parse_mode: 'Markdown',
+      disable_web_page_preview: true,
+      reply_markup: { inline_keyboard: buttons },
+    });
+    if (!result.ok) {
+      // Retry as plain text
+      result = await this.apiCallWithResponse('sendMessage', {
+        chat_id: this.chatId,
+        text: TelegramService.stripMarkdown(converted),
+        disable_web_page_preview: true,
+        reply_markup: { inline_keyboard: buttons },
+      });
+    }
+    return result.ok;
+  }
+
+  /** Answer a callback query (acknowledge button press) */
+  async answerCallbackQuery(callbackQueryId: string, text?: string): Promise<void> {
+    if (!this.botToken) return;
+    await this.apiCall('answerCallbackQuery', {
+      callback_query_id: callbackQueryId,
+      text: text?.substring(0, 200) || '',
+    });
+  }
+
+  /** Edit a message's text (e.g., after button press) */
+  async editMessage(messageId: number, text: string): Promise<void> {
+    if (!this.botToken || !this.chatId) return;
+    await this.apiCall('editMessageText', {
+      chat_id: this.chatId,
+      message_id: messageId,
+      text: TelegramService.toTelegramMarkdown(text),
+      parse_mode: 'Markdown',
+    });
   }
 
   private apiCall(method: string, body: any): Promise<boolean> {

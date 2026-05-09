@@ -19,6 +19,15 @@ class ModelRoutingService {
         userId,
         ...FACTORY_DEFAULTS,
       });
+    } else {
+      // Backfill any factory action routes that were added after this config was created
+      // (e.g. the 'heartbeat' route added after the user already had a config saved).
+      const existingActions = new Set(config.actionRoutes.map(r => r.action));
+      const missing = FACTORY_DEFAULTS.actionRoutes.filter(r => !existingActions.has(r.action));
+      if (missing.length > 0) {
+        config.actionRoutes.push(...missing);
+        await config.save();
+      }
     }
 
     configCache.set(userId, { config, expiresAt: Date.now() + CACHE_TTL_MS });
@@ -158,7 +167,12 @@ class ModelRoutingService {
     };
 
     const since = new Date(Date.now() - days * 86400000);
-    const records = await TokenUsage.find({ userId, createdAt: { $gte: since } }).lean();
+    // Exclude historical per-turn rows that double-count cache reads (see token-usage.service.ts)
+    const records = await TokenUsage.find({
+      userId,
+      createdAt: { $gte: since },
+      'metadata.turn': { $ne: true },
+    }).lean();
 
     let currentCost = 0;
     let sonnetBaseline = 0;

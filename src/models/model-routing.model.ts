@@ -11,7 +11,7 @@ export interface IActionRoute {
   action: string;
   model: ModelTier;
   label: string;
-  category: 'employee' | 'alfred' | 'strategic';
+  category: 'employee' | 'alfred' | 'strategic' | 'heartbeat';
 }
 
 export interface ISubAgentDefaults {
@@ -45,7 +45,7 @@ const actionRouteSchema = new Schema<IActionRoute>(
     action: { type: String, required: true },
     model: { type: String, enum: ['haiku', 'sonnet', 'opus'], required: true },
     label: { type: String, required: true },
-    category: { type: String, enum: ['employee', 'alfred', 'strategic'], required: true },
+    category: { type: String, enum: ['employee', 'alfred', 'strategic', 'heartbeat'], required: true },
   },
   { _id: false },
 );
@@ -94,6 +94,7 @@ export const FACTORY_DEFAULTS = {
     { action: 'answer_question', model: 'sonnet' as ModelTier, label: 'Answering Alfred questions', category: 'employee' as const },
     { action: 'dev_task', model: 'opus' as ModelTier, label: 'Development task', category: 'employee' as const },
     { action: 'test_task', model: 'opus' as ModelTier, label: 'Testing task', category: 'employee' as const },
+    { action: 'fix_task', model: 'sonnet' as ModelTier, label: 'Bug fix task', category: 'employee' as const },
     { action: 'ceo_direction', model: 'opus' as ModelTier, label: 'CEO strategic direction', category: 'strategic' as const },
     { action: 'memory_compaction', model: 'sonnet' as ModelTier, label: 'Memory compaction', category: 'employee' as const },
     { action: 'proactive_scan', model: 'haiku' as ModelTier, label: 'Alfred proactive scans', category: 'alfred' as const },
@@ -103,6 +104,7 @@ export const FACTORY_DEFAULTS = {
     { action: 'alfred_hands_on', model: 'sonnet' as ModelTier, label: 'Alfred hands-on investigation', category: 'alfred' as const },
     { action: 'memory_summary', model: 'haiku' as ModelTier, label: 'Memory summarization', category: 'alfred' as const },
     { action: 'unanswered_recovery', model: 'haiku' as ModelTier, label: 'Unanswered message recovery', category: 'alfred' as const },
+    { action: 'heartbeat', model: 'haiku' as ModelTier, label: 'Recurring heartbeat tasks', category: 'heartbeat' as const },
   ],
   subAgentDefaults: {
     exploration: 'haiku' as const,

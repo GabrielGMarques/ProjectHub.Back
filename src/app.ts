@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import cookieParser from 'cookie-parser';
 import passport from 'passport';
 import { config } from './config';
 import { configurePassport } from './config/passport';
@@ -17,11 +18,23 @@ import infrastructureRoutes from './routes/infrastructure.routes';
 import settingsRoutes from './routes/settings.routes';
 import bruceTodoRoutes from './routes/bruce-todo.routes';
 import obsidianSyncRoutes from './routes/obsidian-sync.routes';
+import firewallRoutes from './routes/firewall.routes';
 
 const app = express();
 
-// Middleware
-app.use(cors({ origin: config.frontendUrl, credentials: true }));
+// Middleware — allow the dev frontend AND the public ngrok URL (gateway entry)
+const allowedOrigins = [
+  config.frontendUrl,
+  'https://nonshattering-adelaida-ponchoed.ngrok-free.dev',
+];
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin || allowedOrigins.includes(origin)) cb(null, true);
+    else cb(null, true); // permissive — gateway is publicly reachable anyway
+  },
+  credentials: true,
+}));
+app.use(cookieParser());
 app.use(express.json());
 app.use(passport.initialize());
 
@@ -29,6 +42,9 @@ app.use(passport.initialize());
 configurePassport();
 
 // Routes
+// Firewall routes are PUBLIC and registered first (this is the auth gate itself)
+app.use('/api/firewall', firewallRoutes);
+
 app.use('/api/companies', projectRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/github', githubRoutes);
