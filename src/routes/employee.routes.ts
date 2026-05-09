@@ -10,6 +10,7 @@ const controller = new EmployeeController();
 // Validated by employee ObjectId — agents don't have JWT tokens
 router.post('/:id/self/status', (req: any, res: any) => controller.selfSetStatus(req, res));
 router.post('/:id/self/task-done', (req: any, res: any) => controller.selfTaskDone(req, res));
+router.post('/:id/self/dismiss', (req: any, res: any) => controller.selfDismiss(req, res));
 router.post('/:id/self/task-update', (req: any, res: any) => controller.selfTaskUpdate(req, res));
 router.post('/:id/self/working-status', (req: any, res: any) => controller.selfWorkingStatus(req, res));
 router.get('/:id/self/status-history', (req: any, res: any) => controller.getSelfStatusHistory(req, res));
@@ -28,7 +29,7 @@ router.all('/:id/self/*', (req: any, res: any) => {
   res.status(404).json({
     error: 'Unknown self-service endpoint',
     availableEndpoints: [
-      'POST /self/status', 'POST /self/task-done', 'POST /self/task-update',
+      'POST /self/status', 'POST /self/task-done', 'POST /self/dismiss', 'POST /self/task-update',
       'POST /self/working-status', 'GET /self/status-history', 'GET /self/team',
       'GET /self/teammate/:id', 'GET /self/direction', 'POST /self/direction',
       'GET /self/applications', 'POST /self/applications',
@@ -103,6 +104,11 @@ router.get('/:id/heartbeat', (req: any, res: any) => controller.getHeartbeat(req
 router.put('/:id/heartbeat', (req: any, res: any) => controller.updateHeartbeat(req, res));
 router.get('/:id/logs', (req: any, res: any) => controller.getLogs(req, res));
 router.get('/:id/status-history', (req: any, res: any) => controller.getStatusHistory(req, res));
+
+// Session history (per-employee + global)
+router.get('/:id/sessions', (req: any, res: any) => controller.getEmployeeSessions(req, res));
+router.get('/sessions/all', (req: any, res: any) => controller.getAllSessions(req, res));
+router.get('/sessions/:sessionId', (req: any, res: any) => controller.getSessionDetail(req, res));
 router.post('/:id/skills', (req: any, res: any) => controller.addSkill(req, res));
 router.delete('/:id/skills/:skillName', (req: any, res: any) => controller.removeSkill(req, res));
 

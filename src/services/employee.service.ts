@@ -13,6 +13,9 @@ import { wsService } from './websocket.service';
 import { TokenUsageService } from './token-usage.service';
 import { WorkingStatusHistory } from '../models/working-status-history.model';
 import { modelRoutingService } from './model-routing.service';
+import { employeeSessionService } from './employee-session.service';
+import os from 'os';
+import { firewallService } from './firewall.service';
 
 const claudeCodeService = new ClaudeCodeService();
 const telegramService = telegramBot;
@@ -170,6 +173,10 @@ export class EmployeeService {
   /** Classify a task string into an action type for model routing */
   private classifyTaskAction(task: string, role: string): string {
     const lower = task.toLowerCase();
+    // Explicit prefixes take precedence — Alfred (or any caller) can route a task
+    // to a specific model tier just by tagging the description.
+    if (lower.startsWith('[heartbeat]') || lower.includes('[heartbeat]')) return 'heartbeat';
+    if (lower.startsWith('[fix]') || lower.includes('[fix]')) return 'fix_task';
     if (lower.includes('[restart') || lower.includes('self-evaluation') || lower.includes('self evaluation')) return 'self_eval';
     if (lower.includes('[message from alfred') || lower.includes('[question from alfred')) return 'answer_question';
     if (role === 'ceo' && (lower.includes('direction') || lower.includes('strategy') || lower.includes('strategic'))) return 'ceo_direction';
@@ -373,6 +380,9 @@ export class EmployeeService {
         employee.taskHistory.push({ taskId, description: task, status: 'in_progress', resultRead: false, startedAt: new Date() });
         await employee.save();
 
+        // Append to the open session row so history reflects the additional task
+        employeeSessionService.addTask(existingSession, taskId).catch(() => {});
+
         const project = await projectService.findById(employee.projectId.toString(), userId);
         const empInfo = { name: employee.name, avatar: employee.avatar, role: employee.role };
         empLog(userId, employee._id.toString(), employee.projectId.toString(), 'task_start',
@@ -529,6 +539,39 @@ DOCKER (MANDATORY):
 - Always include a .dockerignore in each project subfolder (exclude node_modules, .next, dist, etc.).
 - When your task involves running or deploying an app, verify it works inside Docker — do NOT just test with bare "node" or "npm start".
 
+PUBLIC GATEWAY (MANDATORY for any networked app):
+All apps run behind a shared nginx gateway exposed via ngrok at:
+  https://nonshattering-adelaida-ponchoed.ngrok-free.dev
+
+This means EVERY app you build must be reachable via that public URL, not just localhost. Concrete rules:
+
+FRONTENDS:
+- Must work when served from https://nonshattering-adelaida-ponchoed.ngrok-free.dev (cookie-routed root) AND from a sub-path like /your-company__your-app/ (path-routed).
+- Use RELATIVE paths for all assets, API calls, and client-side routes — never hardcode http://localhost or absolute /api/... paths to a specific host.
+- Respect the X-Base-Path header (set by nginx for path-routed apps) if you need to compute the public base URL.
+- For SPA routing, use HTML5 history mode and ensure deep links work both at root and under sub-paths.
+
+BACKENDS / APIs:
+- CORS MUST allow origin https://nonshattering-adelaida-ponchoed.ngrok-free.dev (in addition to localhost during dev).
+- CORS MUST set credentials: true so cookies/auth headers cross the boundary.
+- Trust the X-Forwarded-Proto and X-Forwarded-For headers (set by nginx) — do not assume the request scheme is what your server sees directly.
+- If you set cookies, use SameSite=Lax (or None+Secure for cross-site) and Path=/ — never bind to a specific host.
+- Health check endpoint should return 200 quickly (<1s) so the gateway can route around dead services.
+
+Example CORS config (Express):
+  app.use(cors({
+    origin: ['http://localhost:4567', 'https://nonshattering-adelaida-ponchoed.ngrok-free.dev'],
+    credentials: true,
+  }));
+
+Example CORS config (Fastify):
+  await fastify.register(cors, {
+    origin: ['http://localhost:4567', 'https://nonshattering-adelaida-ponchoed.ngrok-free.dev'],
+    credentials: true,
+  });
+
+Failing to do this means your app works on localhost but breaks the moment Bruce or Alfred tries to access it through the public URL. Test BOTH localhost AND the ngrok URL before marking any app done.
+
 FILE RULES:
 - Always use forward slashes (/) in file paths, never backslashes.
 - When creating new files, use the Write tool with the full absolute path.
@@ -603,6 +646,14 @@ Publishing workflow:
 4. Upload deliverables to the correct folder.
 5. Get the shareable link and include it in your task result or working status.
 6. ALWAYS mention the Drive link when reporting task completion — Bruce and Alfred expect deliverables on Drive, not just locally.
+
+PLAYWRIGHT / BROWSER SAFETY (MANDATORY):
+- NEVER use Playwright to navigate to the Alfred management dashboard (localhost:4567, localhost:9080, or nonshattering-adelaida-ponchoed.ngrok-free.dev when the selected_app cookie is "alfred").
+- NEVER use Playwright to navigate to the /__chooser, /__firewall, or /__clear gateway pages.
+- NEVER click delete/remove buttons in ANY management interface — you are a worker, not an admin.
+- ONLY use Playwright to test YOUR OWN project's applications (the ones you're building).
+- When testing via the gateway, use the path-based URL for your app (e.g., /influencer/monitoring-dashboard/) — do NOT use the root / with cookie routing.
+- If Playwright lands on an unexpected page (login screen, admin panel, chooser), STOP and go back to your project's URL.
 
 ANTI-LOOP PROTECTION (MANDATORY):
 If a tool call or command fails, returns an error, or is denied:
@@ -765,12 +816,39 @@ TASK COMPLETION (2-step — write JSON file then curl it):
 
   Step 2: curl -s -X POST http://localhost:3777/api/employees/${employee._id}/self/task-done -H "Content-Type: application/json" -d @${normCwd}/.agents/task-results/${employee.role}-${taskId}.json
 
-  TO SET IDLE:
-    curl -s -X POST http://localhost:3777/api/employees/${employee._id}/self/status -H "Content-Type: application/json" -d '{"status":"idle"}'
-
   SIMPLEST FALLBACK:
     Write result to: ${normCwd}/.agents/task-results/${employee.role}-${taskId}.md
     Write "STATE: done and idle" in: ${normCwd}/.agents/status/${employee.role}.md
+
+═══════════════════════════════════════════════════════════════════
+CRITICAL — SIGN OFF WHEN YOU'RE DONE (DO NOT SKIP):
+═══════════════════════════════════════════════════════════════════
+After you have:
+  1. Marked your task(s) done via /self/task-done
+  2. Updated your working status with the final summary
+  3. Verified your inbox (curl /self/team or /self/teammate) has nothing pending for you
+  4. Confirmed nothing in .agents/comms/ is addressed to you and unhandled
+
+…you MUST dismiss yourself by calling:
+  curl -s -X POST http://localhost:3777/api/employees/${employee._id}/self/dismiss
+
+This terminates your SDK session and frees its in-memory context. Once dismissed,
+your session ends immediately — no more turns will run, no more tokens will be spent.
+A fresh session will be spawned automatically when new work arrives.
+
+DO NOT keep "looking for things to do" once your assigned work is complete.
+DO NOT loop checking status, inbox, or comms hoping to find new work — that wastes
+tokens. Sign off explicitly. If new work comes, you will be re-spawned.
+
+DO NOT dismiss yourself if:
+  - You still have in_progress tasks (the API will reject the dismiss with 400)
+  - You have unread inbox messages from teammates or Alfred
+  - Your working status says "stuck" or "blocked" — escalate first
+  - You just received a new message and haven't responded to it yet
+
+The dismiss endpoint will refuse with HTTP 400 if any task is still in_progress.
+If you see that error: mark each pending task done (or failed) first, then dismiss.
+═══════════════════════════════════════════════════════════════════
 
 ${skillsCtx}
 ${personalSkillsCtx}
@@ -866,10 +944,26 @@ Only use this for genuinely complex problems. Your session will restart with the
     let finalStatus: 'completed' | 'failed' | 'cancelled' = 'failed';
     let lastError = '';
 
+    // Track which internalSessionId we registered with the session service so the
+    // 'done' event can end the right row even if other events fire after start.
+    let trackedSessionId: string | undefined;
+
     const eventHandler = (event: any) => {
       // Capture session ID on start so we can resume later
       if (event.type === 'start' && event.sessionId) {
         Employee.findByIdAndUpdate(employeeId, { activeSessionId: event.sessionId }).catch(() => {});
+        // Begin session tracking for the history panel
+        trackedSessionId = event.sessionId;
+        employeeSessionService.start({
+          userId, employeeId: eId, projectId: pId,
+          internalSessionId: event.sessionId,
+          sdkSessionId: event.sdkSessionId || '',
+          employeeName: employee.name,
+          employeeRole: employee.role,
+          projectName: pName,
+          aiModel: resolvedModel,
+          taskId,
+        }).catch(() => {});
       }
       // Conversation ended in keepAlive mode — keep session reference for resume
       if (event.type === 'task_idle') {
@@ -880,6 +974,13 @@ Only use this for genuinely complex problems. Your session will restart with the
           fresh.save().catch(() => {});
           this.collectInboxMessages(userId, eId, pId, cwd, empInfo, pName, taskId).catch(() => {});
         }).catch(() => {});
+      }
+      // Final teardown — close out the session row
+      if (event.type === 'done' && trackedSessionId) {
+        const reason = (finalStatus === 'completed' || finalStatus === 'cancelled')
+          ? finalStatus
+          : 'failed';
+        employeeSessionService.end(trackedSessionId, reason as any).catch(() => {});
       }
       if (event.type === 'tool_use') {
         empLog(userId, eId, pId, 'tool_use', `${event.tool}: ${(event.content || '').substring(0, 300)}`, empInfo, pName, { tool: event.tool });
@@ -894,20 +995,12 @@ Only use this for genuinely complex problems. Your session will restart with the
           telegramBot.send(`⚠️ *${employee.name}* is blocked by permissions on _${pName}_. Config ${check.fixed ? 'fixed' : 'OK'} — restart employee to apply: tell Alfred "restart ${employee.name}"`).catch(() => {});
         }
       } else if (event.type === 'turn_usage' && event.turnUsage) {
-        // Record every AI turn's token usage individually (per-interaction granularity)
+        // Per-turn data is logged for visibility but NOT inserted as a TokenUsage row.
+        // The SDK reports each call's `cache_read_input_tokens` as the cumulative cached
+        // prefix seen by THAT call — not a delta. Summing per-turn rows therefore
+        // multi-counts the same cache reads ~5×. The segment 'token_usage' event
+        // (handled below) is the canonical bill from the SDK's `result` message.
         const tu = event.turnUsage;
-        tokenUsageService.record({
-          userId, employeeId: eId, projectId: pId,
-          source: 'employee',
-          aiModel: tu.model,
-          inputTokens: tu.inputTokens,
-          outputTokens: tu.outputTokens,
-          cacheReadTokens: tu.cacheReadTokens,
-          cacheCreationTokens: tu.cacheCreationTokens,
-          costUsd: 0, // cost is only available at segment level
-          numTurns: 1,
-          metadata: { taskId, taskDescription: task.substring(0, 200), employeeName: employee.name, employeeRole: employee.role, turn: true, tools: tu.tools },
-        });
         empLog(userId, eId, pId, 'token_usage',
           `📊 Turn: ${tu.inputTokens} in / ${tu.outputTokens} out | tools: ${tu.tools.join(', ') || 'text'}`,
           empInfo, pName, { turnUsage: tu });
@@ -927,6 +1020,17 @@ Only use this for genuinely complex problems. Your session will restart with the
           numTurns: tu.numTurns,
           metadata: { taskId, taskDescription: task.substring(0, 200), employeeName: employee.name, employeeRole: employee.role, segment: true },
         });
+        // Aggregate the segment into the session row for the history panel
+        if (trackedSessionId) {
+          employeeSessionService.addUsage(trackedSessionId, {
+            inputTokens: tu.inputTokens,
+            outputTokens: tu.outputTokens,
+            cacheReadTokens: tu.cacheReadTokens,
+            cacheCreationTokens: tu.cacheCreationTokens,
+            costUsd: tu.costUsd,
+            numTurns: tu.numTurns,
+          }).catch(() => {});
+        }
         empLog(userId, eId, pId, 'token_usage',
           `💰 Segment total: ${tu.inputTokens} in / ${tu.outputTokens} out / ${tu.cacheReadTokens} cache | $${tu.costUsd.toFixed(4)} | ${tu.numTurns} turns`,
           empInfo, pName, { tokenUsage: tu });
@@ -967,20 +1071,30 @@ Only use this for genuinely complex problems. Your session will restart with the
           : prompt;
 
         try {
+          // Write Playwright storage state with project-scoped cookies + blocked origins
+          const pwState = await this.writePlaywrightState(employee, project);
+
           const result = await claudeCodeService.runCommand(cwd, currentPrompt, eventHandler, {
             allowedTools: SDK_ALLOWED_TOOLS,
             // No resumeSdkSessionId — always fresh session to avoid 20M+ cache costs
             keepAlive: true,
             model: resolvedModel,
             mcpServers: {
-              playwright: { command: 'npx', args: ['@playwright/mcp@latest'] },
+              playwright: {
+                command: 'npx',
+                args: [
+                  '@playwright/mcp@latest',
+                  '--storage-state', pwState.statePath,
+                  '--blocked-origins', pwState.blockedOrigins,
+                ],
+              },
             },
             shouldContinue: async () => {
-              // Auto-continue only if the task result is still empty (employee didn't call task-done)
-              const fresh = await Employee.findById(employeeId);
-              if (!fresh) return false;
-              const task = fresh.taskHistory.find(t => t.taskId === taskId);
-              return task?.status === 'in_progress' && !task.result;
+              // Never auto-resurrect. The agent decides when it's done by calling
+              // /self/dismiss explicitly. Forcing continuation produced "looking for
+              // work" loops that wasted tokens. Alfred's 5-min status nudge is the
+              // safety net for genuinely hung agents.
+              return false;
             },
           });
 
@@ -1599,6 +1713,55 @@ INSTRUCTIONS:
    * Compares both settings.local.json and ~/.claude.json trust entry.
    * Returns { valid, issues[] }. If invalid, automatically fixes the config.
    */
+  /**
+   * Write a Playwright storage-state JSON file for this employee.
+   * Pre-loads cookies (firewall_token, selected_app, project_scope) so the employee's
+   * Playwright browser is scoped to their own project's apps on the gateway.
+   * Also returns the blocked-origins string to prevent access to Alfred + backend.
+   */
+  private async writePlaywrightState(employee: any, project: any): Promise<{ statePath: string; blockedOrigins: string }> {
+    const stateDir = path.join(os.tmpdir(), 'alfred-pw-states');
+    fs.mkdirSync(stateDir, { recursive: true });
+    const statePath = path.join(stateDir, `${employee._id}.json`);
+
+    const NGROK_DOMAIN = 'nonshattering-adelaida-ponchoed.ngrok-free.dev';
+    const projectSlug = (project.name as string).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+
+    // Get a persistent local firewall token for employees
+    const firewallToken = await firewallService.getOrCreateLocalToken();
+
+    // Find the project's primary frontend app cookie value
+    const apps = project.applications || [];
+    const frontend = apps.find((a: any) => a.type === 'frontend' || a.type === 'fullstack') || apps[0];
+    const selectedApp = frontend
+      ? `${projectSlug}__${(frontend.name as string).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')}`
+      : '';
+
+    // Cookies valid for 30 days
+    const expires = Math.floor(Date.now() / 1000) + 30 * 24 * 3600;
+
+    const storageState = {
+      cookies: [
+        { name: 'firewall_token', value: firewallToken, domain: NGROK_DOMAIN, path: '/', expires, httpOnly: false, secure: true, sameSite: 'Lax' as const },
+        { name: 'firewall_token', value: firewallToken, domain: 'localhost', path: '/', expires, httpOnly: false, secure: false, sameSite: 'Lax' as const },
+        ...(selectedApp ? [
+          { name: 'selected_app', value: selectedApp, domain: NGROK_DOMAIN, path: '/', expires, httpOnly: false, secure: true, sameSite: 'Lax' as const },
+          { name: 'selected_app', value: selectedApp, domain: 'localhost', path: '/', expires, httpOnly: false, secure: false, sameSite: 'Lax' as const },
+        ] : []),
+        { name: 'project_scope', value: projectSlug, domain: NGROK_DOMAIN, path: '/', expires, httpOnly: false, secure: true, sameSite: 'Lax' as const },
+        { name: 'project_scope', value: projectSlug, domain: 'localhost', path: '/', expires, httpOnly: false, secure: false, sameSite: 'Lax' as const },
+      ],
+      origins: [],
+    };
+
+    fs.writeFileSync(statePath, JSON.stringify(storageState, null, 2), 'utf-8');
+
+    // Block Alfred frontend + backend API (employees must never reach these)
+    const blockedOrigins = 'http://localhost:4567;http://localhost:3777';
+
+    return { statePath: statePath.replace(/\\/g, '/'), blockedOrigins };
+  }
+
   private validateClaudeConfig(cwd: string): { valid: boolean; issues: string[]; fixed: boolean } {
     const issues: string[] = [];
     let fixed = false;

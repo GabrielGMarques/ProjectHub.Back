@@ -598,6 +598,13 @@ Be Alfred. Be sharp. Hit the ground running.`;
       let finalResponse = finalClean;
       if (allActionResults.length && this.commMode === 'verbose') {
         finalResponse += '\n\n' + allActionResults.join('\n');
+      } else {
+        // In chat mode we hide successes, but errors must always reach Bruce on Telegram —
+        // otherwise he sees Alfred's optimistic reply with no hint that something failed.
+        const errors = allActionResults.filter(r => r.startsWith('❌'));
+        if (errors.length) {
+          finalResponse += (finalResponse ? '\n\n' : '') + errors.join('\n');
+        }
       }
 
       // Save ONLY Alfred's own analysis to memory
@@ -909,6 +916,14 @@ You can execute actions by including action blocks in your response. Use this ex
 \`\`\`manager-action
 {"action": "task", "employeeId": "<id>", "task": "description of what to do"}
 \`\`\`
+TASK TYPE PREFIXES (IMPORTANT for cost optimization — pick the right one):
+- For BUG FIXES, error corrections, regression patches, "make X work again" tasks:
+  prefix the task description with [FIX], e.g.:
+  {"action": "task", "employeeId": "<id>", "task": "[FIX] Login button doesn't redirect after submit — investigate src/pages/Login.tsx and patch"}
+  Fix tasks run on a cheaper, faster model tier (Sonnet by default) since they're scoped and don't need deep architectural reasoning.
+- For NEW FEATURES, refactors, large builds, design decisions: NO prefix — the task runs on the role's default model (typically Opus).
+- For TESTS: include "test", "qa", "verify", or "playwright" in the description (no prefix needed).
+- DO NOT add [FIX] to anything that is genuinely new development — it'll be under-modeled and produce worse results.
 
 \`\`\`manager-action
 {"action": "add_todos", "projectId": "<id>", "items": ["todo 1", "todo 2"]}
@@ -1112,8 +1127,12 @@ BRUCE-ONLY ACTIONS (only use when Bruce EXPLICITLY asks you to inspect files or 
 \`\`\`manager-action
 {"action": "hands_on_async", "projectId": "<id>", "task": "description", "mode": "fix"}
 \`\`\`
-These 4 actions are FORBIDDEN during proactive scans. ONLY use them when Bruce says "check file X", "look at the code", etc.
-To understand employee work, use read_employee_status, read_employee_status_history, read_task_results, or ask_employee instead.
+\`\`\`manager-action
+{"action": "inspect_employee_files", "employeeId": "<id>", "task": "what to look for in their files/work"}
+\`\`\`
+Spawns a Sonnet sub-agent inside the employee's project folder with read-only tools (Read/Glob/Grep) and 3-minute budget. **ASYNC — fires in the background and reports back to Bruce on Telegram as a separate message when done.** You return a short "looking at X..." acknowledgement; do NOT wait for the report inside this turn. Use when Bruce asks you to look at what an employee is actually doing in their files (status reports, comms, code they touched, .agents/ artifacts).
+These 5 actions are FORBIDDEN during proactive scans. ONLY use them when Bruce says "check file X", "look at the code", "what's in their .agents folder", etc.
+To understand employee work without reading files, use read_employee_status, read_employee_status_history, read_task_results, or ask_employee instead.
 
 RULES:
 - Follow your Operating Manual (purpose.md) above. Revenue is your #1 priority.
@@ -1287,6 +1306,7 @@ RULES:
       case 'read_employee_status':         return `${a}:${action.employeeId}`;
       case 'read_employee_status_history': return `${a}:${action.employeeId}`;
       case 'read_task_results':            return `${a}:${action.employeeId}:${action.unread || false}`;
+      case 'inspect_employee_files':       return `${a}:${action.employeeId}:${(action.task || '').substring(0, 80)}`;
       case 'mark_tasks_read':              return `${a}:${action.employeeId}`;
       case 'add_application':    return `${a}:${action.projectId}:${action.name}`;
       case 'remove_application': return `${a}:${action.projectId}:${action.name}`;
@@ -2000,6 +2020,27 @@ RULES:
           timeoutMs: action.timeout,
         });
       }
+      case 'inspect_employee_files': {
+        if (!action.employeeId || !action.task) throw new Error('employeeId and task required');
+        const emp = await Employee.findOne({ _id: action.employeeId, userId });
+        if (!emp) throw new Error('Employee not found');
+        const project = await Project.findById(emp.projectId);
+        const pName = project?.name || 'Unknown';
+
+        // Fire-and-forget — Alfred returns immediately so the Telegram thread isn't blocked
+        // while the Sonnet sub-agent runs (can take up to 3 min). The summary is delivered
+        // to Telegram as a separate message when the sub-agent finishes.
+        this.inspectEmployeeFiles(action.employeeId, userId, action.task).then(
+          (result) => {
+            telegramService.send(result).catch(() => {});
+          },
+          (err) => {
+            telegramService.send(`❌ Inspection of ${emp.avatar} ${emp.name} failed: ${err.message}`).catch(() => {});
+          },
+        );
+
+        return `🔍 Looking at ${emp.avatar} ${emp.name}'s files on ${pName}: "${action.task.substring(0, 80)}${action.task.length > 80 ? '...' : ''}" — will report back here when done.`;
+      }
       case 'hands_on_async': {
         if (!action.projectId || !action.task) throw new Error('projectId and task required');
         const project = await Project.findById(action.projectId);
@@ -2259,6 +2300,69 @@ ${task}`;
       persistLog('error', `Hands-on failed: ${errMsg}`, { userId });
       appendDailyLog(`❌ Hands-on failed: ${errMsg}`);
       return `❌ Hands-on failed: ${errMsg}`;
+    }
+  }
+
+  /** Spawn a Sonnet Claude Code sub-agent inside an employee's project folder with read-only tools.
+   *  Used when Bruce asks Alfred to look at what the employee is actually doing in their files. */
+  private async inspectEmployeeFiles(employeeId: string, userId: string, task: string): Promise<string> {
+    const emp = await Employee.findOne({ _id: employeeId, userId });
+    if (!emp) throw new Error('Employee not found');
+
+    const project = await Project.findById(emp.projectId);
+    if (!project) throw new Error(`Project not found for ${emp.name}`);
+
+    const allFolders = [...(project.folders || [])];
+    if (project.localPath && !allFolders.includes(project.localPath)) allFolders.unshift(project.localPath);
+    const cwd = allFolders[0];
+    if (!cwd) throw new Error(`Project ${project.name} has no folders configured`);
+
+    const timeoutMs = 3 * 60 * 1000;
+    const prompt = `You are a read-only inspector working for Alfred (the manager of ProjectsHub).
+You are inspecting the work of employee "${emp.name}" (${emp.role}) on project "${project.name}".
+You are inside their project folder: ${cwd}
+
+EMPLOYEE-SPECIFIC ARTIFACTS to consider (if relevant):
+- .agents/status/         employee status reports (markdown)
+- .agents/comms/          inter-employee messages
+- .agents/exec-logs/      tool/command execution logs
+- .agents/inbox/          messages addressed to this employee
+- .agents/personal-skills/ patterns the employee has learned
+- .agents/task-results/   completed task outputs
+
+RULES:
+- READ-ONLY. Do NOT edit, write, or run shell commands. You have only Read, Glob, Grep.
+- Be FAST and FOCUSED. You have ${Math.round(timeoutMs / 60000)} minutes max.
+- Produce a CONCISE markdown report of findings (under 400 words).
+- Quote short, relevant excerpts from files — do NOT paste entire files.
+- Use forward slashes in all paths.
+
+WHAT TO LOOK FOR:
+${task}`;
+
+    log('info', `Inspect ${emp.name}'s files on ${project.name}: ${task.substring(0, 100)}`);
+    persistLog('action', `Inspect ${emp.name}: ${task.substring(0, 100)}`, { userId });
+    appendDailyLog(`🔍 Inspecting ${emp.avatar} ${emp.name}'s files on ${project.name}: ${task.substring(0, 100)}`);
+
+    try {
+      const { result, status } = await claudeCodeService.runQuick(cwd, prompt, {
+        allowedTools: ['Read', 'Glob', 'Grep'],
+        timeoutMs,
+        model: 'sonnet',
+      });
+
+      const statusIcon = status === 'completed' ? '✅' : status === 'failed' ? '❌' : '⏰';
+      const truncated = result.substring(0, 3000);
+      appendDailyLog(`🔍 Inspect result [${status}]: ${truncated.substring(0, 200)}`);
+      persistLog('action', `Inspect [${status}]: ${truncated.substring(0, 150)}`, { userId });
+
+      return `${statusIcon} Inspected ${emp.avatar} ${emp.name}'s files on ${project.name} (${status}):\n\n${truncated}`;
+    } catch (err: any) {
+      const errMsg = err.message || 'Unknown error';
+      log('error', `Inspect employee files failed: ${errMsg}`);
+      persistLog('error', `Inspect employee files failed: ${errMsg}`, { userId });
+      appendDailyLog(`❌ Inspect failed: ${errMsg}`);
+      return `❌ Inspect failed: ${errMsg}`;
     }
   }
 

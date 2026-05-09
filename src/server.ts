@@ -8,8 +8,12 @@ import { wsService } from './services/websocket.service';
 import { User } from './models/user.model';
 import { Project } from './models/project.model';
 import { Employee } from './models/employee.model';
+import { EmployeeSession } from './models/employee-session.model';
 import { managerService } from './services/manager.service';
 import { heartbeatService } from './services/heartbeat.service';
+import { infrastructureService } from './services/infrastructure.service';
+import { firewallTelegramService } from './services/firewall-telegram.service';
+import { firewallService } from './services/firewall.service';
 
 const claudeCodeService = new ClaudeCodeService();
 const telegramService = telegramBot;
@@ -28,6 +32,13 @@ function countDone(todos: any[]): number {
 async function startServer(): Promise<void> {
   await connectDatabase();
 
+  // Ensure the gateway nginx project files always exist (so docker-compose can mount them)
+  try {
+    infrastructureService.ensureNginxProject();
+  } catch (err: any) {
+    console.warn(`[Startup] ensureNginxProject failed: ${err.message}`);
+  }
+
   // Migration: mark all existing task results as read (one-time)
   await Employee.updateMany(
     { 'taskHistory.resultRead': { $exists: false } },
@@ -38,6 +49,56 @@ async function startServer(): Promise<void> {
   const cleaned = await claudeCodeService.cleanupStaleSessions();
   if (cleaned > 0) {
     console.log(`[Startup] Cleaned up ${cleaned} stale agent sessions`);
+  }
+
+  // ── Clear all employee SDK session state ──────────────────────────────
+  // Restarting the backend kills every in-memory SDK conversation. Any
+  // employee with a non-empty activeSessionId or status='working' is now
+  // pointing at a ghost. Reset them to idle so the next task starts clean,
+  // and close any open EmployeeSession rows in the history with reason='restarted'.
+  try {
+    const empResult = await Employee.updateMany(
+      {
+        $or: [
+          { activeSessionId: { $nin: ['', null] } },
+          { sdkSessionId: { $nin: ['', null] } },
+          { currentTask: { $nin: ['', null] } },
+          { status: 'working' },
+        ],
+      },
+      {
+        $set: {
+          activeSessionId: '',
+          sdkSessionId: '',
+          currentTask: '',
+          status: 'idle',
+          lastActivity: new Date(),
+        },
+      },
+    );
+    if (empResult.modifiedCount > 0) {
+      console.log(`[Startup] Reset ${empResult.modifiedCount} employee(s) to idle — stale SDK sessions cleared`);
+    }
+
+    // Close open session rows. MongoDB aggregation-pipeline update lets us
+    // compute durationMs per row from startedAt in a single query.
+    const sessionResult = await EmployeeSession.updateMany(
+      { endedAt: { $exists: false } },
+      [
+        {
+          $set: {
+            endedAt: '$$NOW',
+            endReason: 'restarted',
+            durationMs: { $subtract: ['$$NOW', '$startedAt'] },
+          },
+        },
+      ],
+    );
+    if (sessionResult.modifiedCount > 0) {
+      console.log(`[Startup] Closed ${sessionResult.modifiedCount} open session row(s) as 'restarted'`);
+    }
+  } catch (err: any) {
+    console.warn(`[Startup] Failed to clear stale employee sessions: ${err.message}`);
   }
 
   // Telegram bot — always register command handler so setup screen can start polling later
@@ -128,6 +189,56 @@ async function startServer(): Promise<void> {
         return result + '\n\n🔄 Alfred restarted fresh.';
       }
 
+      // /apps — show all registered apps with inline buttons (Open + Share)
+      if (cmd === '/apps') {
+        const allApps = await infrastructureService.getAllApplications(userId);
+        if (!allApps.length) return '📱 No applications registered yet.';
+
+        const NGROK = 'https://nonshattering-adelaida-ponchoed.ngrok-free.dev';
+        const slugify = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+
+        // Group by company
+        const byCompany = new Map<string, typeof allApps>();
+        for (const item of allApps) {
+          if (!byCompany.has(item.companyName)) byCompany.set(item.companyName, []);
+          byCompany.get(item.companyName)!.push(item);
+        }
+
+        let msg = '📱 *Applications*\n';
+        const buttons: { text: string; callback_data?: string; url?: string }[][] = [];
+
+        for (const [company, apps] of byCompany.entries()) {
+          msg += `\n*${company}*\n`;
+          for (const { app } of apps) {
+            const cs = slugify(company);
+            const as = slugify(app.name);
+            const cookieSlug = `${cs}__${as}`;
+            const appUrl = `${NGROK}/${cookieSlug}`;
+            msg += `• ${app.name} (${app.type}:${app.port})\n`;
+            buttons.push([
+              { text: `🔗 ${app.name}`, url: appUrl },
+              { text: `📤 Share`, callback_data: `share:${cookieSlug}` },
+            ]);
+          }
+        }
+
+        await telegramService.sendWithKeyboard(msg, buttons);
+        return ''; // already sent via sendWithKeyboard
+      }
+
+      // /share <app-slug> — generate a one-time share link for a specific app
+      if (cmd === '/share') {
+        if (!args.trim()) return '⚠️ Usage: /share <app-slug>\nUse /apps to see available apps.';
+        const shareToken = await firewallService.generateShareToken(args.trim());
+        const NGROK = 'https://nonshattering-adelaida-ponchoed.ngrok-free.dev';
+        const url = `${NGROK}/${args.trim()}?access=${shareToken}`;
+        await telegramService.sendWithKeyboard(
+          `🔗 *One-time share link for* \`${args.trim()}\`\n\nLink expires in 7 days and works only once.`,
+          [[{ text: '📋 Copy Link', url }]],
+        );
+        return '';
+      }
+
       // Everything else goes to the AI Manager — natural language
       const message = args ? `${cmd} ${args}`.trim() : cmd;
       return managerService.handleMessage(message, userId);
@@ -135,6 +246,25 @@ async function startServer(): Promise<void> {
 
     // Always register the handler (so setup screen can start polling later)
     // Only actually start polling if bot token is already configured
+    // Register callback query handler for inline keyboard buttons (apps share, etc.)
+    telegramService.setCallbackQueryHandler(async (data: string, callbackQueryId: string, _messageId: number) => {
+      if (data.startsWith('share:')) {
+        const appSlug = data.substring(6);
+        const uId = await resolveUserId();
+        if (!uId) { await telegramService.answerCallbackQuery(callbackQueryId, 'No user'); return; }
+        const shareToken = await firewallService.generateShareToken(appSlug);
+        const NGROK = 'https://nonshattering-adelaida-ponchoed.ngrok-free.dev';
+        const url = `${NGROK}/${appSlug}?access=${shareToken}`;
+        await telegramService.answerCallbackQuery(callbackQueryId, 'Share link generated!');
+        await telegramService.sendWithKeyboard(
+          `🔗 *One-time link for* \`${appSlug}\`\n\nExpires in 7 days. Works once.`,
+          [[{ text: '🌐 Open / Share', url }]],
+        );
+      } else {
+        await telegramService.answerCallbackQuery(callbackQueryId);
+      }
+    });
+
     if (telegramService.isConfigured) {
       telegramService.startPolling(telegramCommandHandler);
       telegramService.send('🚀 *Alfred* is online!\nType /help for commands.').then(ok => {
@@ -172,6 +302,20 @@ async function startServer(): Promise<void> {
 
   // Start the heartbeat scheduler (recurring per-employee tasks)
   heartbeatService.start();
+
+  // Start the firewall Telegram bot — gateway access approval
+  firewallTelegramService.setCallbackHandler(async (action, requestId) => {
+    if (action === 'approve') {
+      const result = await firewallService.approve(requestId);
+      if (!result) return { ok: false, reply: 'Request not found or already decided.' };
+      return { ok: true, reply: `Access granted to ${result.visitorName}` };
+    } else {
+      const result = await firewallService.reject(requestId);
+      if (!result) return { ok: false, reply: 'Request not found or already decided.' };
+      return { ok: true, reply: `Access denied for ${result.visitorName}` };
+    }
+  });
+  firewallTelegramService.startPolling();
 
   const server = http.createServer(app);
   wsService.init(server);

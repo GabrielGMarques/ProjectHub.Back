@@ -19,12 +19,15 @@ import { ManagerInbox } from '../models/manager-inbox.model';
 import { modelRoutingService } from '../services/model-routing.service';
 import { ModelTier } from '../models/model-routing.model';
 import { obsidianSyncService } from '../services/obsidian-sync.service';
+import { ClaudeCodeService } from '../services/claude-code.service';
+import { employeeSessionService } from '../services/employee-session.service';
 
 const infraService = new InfrastructureService();
 
 const employeeService = new EmployeeService();
 const projectService = new ProjectService();
 const telemetryService = new TelemetryService();
+const claudeCodeService = new ClaudeCodeService();
 
 export class EmployeeController {
 
@@ -508,6 +511,79 @@ export class EmployeeController {
     }
   }
 
+  /**
+   * Employee dismisses itself — terminates the SDK session and clears in-memory context.
+   * Called by the agent via curl when it has verified there is nothing left to do.
+   * Soft-refuses if any task is still in_progress (forces the agent to be deliberate).
+   */
+  async selfDismiss(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const emp = await Employee.findById(req.params.id);
+      if (!emp) { res.status(404).json({ error: 'Employee not found' }); return; }
+
+      // Soft refusal — force the agent to mark pending tasks before signing off
+      const pendingTasks = emp.taskHistory
+        .filter(t => t.status === 'in_progress')
+        .map(t => ({ taskId: t.taskId, description: t.description }));
+      if (pendingTasks.length > 0) {
+        res.status(400).json({
+          error: `Cannot dismiss — ${pendingTasks.length} task(s) still in_progress. Mark them done or failed first.`,
+          pendingTasks,
+        });
+        return;
+      }
+
+      const sessionIdToCancel = emp.activeSessionId;
+
+      // Clear state flags BEFORE cancelling the session — so the next event doesn't
+      // see stale references and try to act on them.
+      emp.activeSessionId = '';
+      emp.sdkSessionId = '';
+      emp.currentTask = '';
+      emp.status = 'idle';
+      emp.lastActivity = new Date();
+      await emp.save();
+
+      // Log the dismiss event
+      const uid = emp.userId.toString();
+      const project = await projectService.findById(emp.projectId.toString(), uid);
+      EmployeeLog.create({
+        userId: uid, employeeId: emp._id.toString(), projectId: emp.projectId.toString(),
+        category: 'task_complete',
+        content: `💤 Self-dismissed — session terminated, in-memory context cleared`,
+        employeeName: emp.name, employeeAvatar: emp.avatar, employeeRole: emp.role,
+        projectName: project?.name || 'Unknown',
+      }).catch(() => {});
+
+      wsService.employeeStatusChanged(emp._id.toString(), emp.projectId.toString(), 'idle', emp.name);
+
+      // Mark the session row as dismissed in the history before cancelling
+      if (sessionIdToCancel) {
+        employeeSessionService.end(sessionIdToCancel, 'dismissed').catch(() => {});
+      }
+
+      // Respond to the agent's curl FIRST, then cancel the session.
+      // Cancelling kills the agent's bash subprocess that's awaiting this response,
+      // so we want the response to be flushed before the SDK process tears down.
+      res.json({
+        message: 'Dismissed. Session terminated and in-memory context cleared. Goodbye.',
+        dismissed: true,
+      });
+
+      // Cancel the SDK session — frees in-memory conversation context
+      if (sessionIdToCancel) {
+        // Small delay to give the response time to flush over the wire
+        setTimeout(() => {
+          try {
+            claudeCodeService.cancelSession(sessionIdToCancel);
+          } catch (e) { /* session may already be gone */ }
+        }, 100);
+      }
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+
   /** Employee updates the result/description of a task */
   async selfTaskUpdate(req: AuthRequest, res: Response): Promise<void> {
     try {
@@ -872,6 +948,67 @@ ${currentTask.description}`;
         intervalMs: emp.heartbeatIntervalMs,
         prompt: emp.heartbeatPrompt,
         lastHeartbeatAt: emp.lastHeartbeatAt,
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+
+  // ── Session History ──────────────────────────────────────────────────────
+
+  /** GET /employees/:id/sessions — sessions for one employee, newest first */
+  async getEmployeeSessions(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const limit = Math.min(parseInt(req.query.limit as string) || 50, 200);
+      // Verify the employee belongs to this user
+      const emp = await Employee.findOne({ _id: req.params.id, userId: req.userId }).select('_id').lean();
+      if (!emp) { res.status(404).json({ error: 'Employee not found' }); return; }
+
+      const sessions = await employeeSessionService.getByEmployee(req.params.id, limit);
+      res.json(sessions);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+
+  /** GET /sessions — all sessions for the user, newest first, paginated */
+  async getAllSessions(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const page = Math.max(parseInt(req.query.page as string) || 1, 1);
+      const pageSize = Math.min(parseInt(req.query.pageSize as string) || 50, 200);
+      const result = await employeeSessionService.getAll(req.userId!, page, pageSize);
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  }
+
+  /** GET /sessions/:sessionId — one session's details + logs in its time window */
+  async getSessionDetail(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const result = await employeeSessionService.getById(req.params.sessionId, req.userId!);
+      if (!result) { res.status(404).json({ error: 'Session not found' }); return; }
+
+      // Look up the actual task descriptions for the session's taskIds
+      const emp = await Employee.findById(result.session.employeeId).select('taskHistory name avatar role').lean();
+      const taskDetails = (result.session.taskIds || []).map(tid => {
+        const task = (emp?.taskHistory || []).find((t: any) => t.taskId === tid);
+        return task
+          ? {
+              taskId: tid,
+              description: task.description,
+              status: task.status,
+              result: task.result,
+              startedAt: task.startedAt,
+              completedAt: task.completedAt,
+            }
+          : { taskId: tid, description: '(task not found)', status: 'unknown' };
+      });
+
+      res.json({
+        session: result.session,
+        tasks: taskDetails,
+        logs: result.logs,
       });
     } catch (err: any) {
       res.status(500).json({ error: err.message });

@@ -33,7 +33,8 @@ router.post('/pick-folder', (req: any, res: any) => controller.pickFolder(req, r
 router.get('/:id', (req, res) => controller.getById(req, res));
 router.put('/:id', validateProject, (req: any, res: any) => controller.update(req, res));
 router.patch('/:id', validateProject, (req: any, res: any) => controller.update(req, res));
-router.delete('/:id', (req, res) => controller.delete(req, res));
+// Project deletion disabled — too destructive, employees can trigger it via Playwright
+// router.delete('/:id', (req, res) => controller.delete(req, res));
 
 // File explorer routes
 router.get('/:id/files/list', (req: any, res: any) => controller.listFiles(req, res));

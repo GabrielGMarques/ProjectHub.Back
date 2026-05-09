@@ -3,3 +3,15 @@ dist/
 .env
 coverage/
 *.log
+
+# Auto-provisioned employee skills/agents
+**/.agents/
+**/.claude/skills/
+**/.claude/agents/
+**/.claude/settings.local.json
+**/skills/
+**/agents/
+
+# Uploads / runtime
+uploads/
+**/.playwright-mcp/
