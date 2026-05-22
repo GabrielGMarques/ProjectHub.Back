@@ -36,6 +36,11 @@ function getTodayLogPath(): string {
   return path.join(DAYS_DIR, `${date}.md`);
 }
 
+const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp']);
+function TelegramService_isPhotoExt(filename: string): boolean {
+  return PHOTO_EXTS.has(path.extname(filename).toLowerCase());
+}
+
 function readMemoryFile(filePath: string): string {
   try {
     if (fs.existsSync(filePath)) return fs.readFileSync(filePath, 'utf-8');
@@ -1131,7 +1136,17 @@ BRUCE-ONLY ACTIONS (only use when Bruce EXPLICITLY asks you to inspect files or 
 {"action": "inspect_employee_files", "employeeId": "<id>", "task": "what to look for in their files/work"}
 \`\`\`
 Spawns a Sonnet sub-agent inside the employee's project folder with read-only tools (Read/Glob/Grep) and 3-minute budget. **ASYNC — fires in the background and reports back to Bruce on Telegram as a separate message when done.** You return a short "looking at X..." acknowledgement; do NOT wait for the report inside this turn. Use when Bruce asks you to look at what an employee is actually doing in their files (status reports, comms, code they touched, .agents/ artifacts).
-These 5 actions are FORBIDDEN during proactive scans. ONLY use them when Bruce says "check file X", "look at the code", "what's in their .agents folder", etc.
+\`\`\`manager-action
+{"action": "telegram_send_file", "path": "D:/full/absolute/path/to/file.ext", "caption": "optional short caption", "asPhoto": false}
+\`\`\`
+Uploads a file from disk to Bruce on Telegram. Use when Bruce says "send me X", "share that screenshot", "give me the file", etc.
+\`path\` MUST be an ABSOLUTE path — the full path on disk. Examples:
+  - \`D:/GrowthMaster/Repos/IsabelliFinance/.agents/comms/leads.csv\`
+  - \`D:/Projects/ProjectsHub/ManagerMemory/days/2026-05-11.md\`
+NEVER pass a relative path or just a filename — always the full absolute path. The action does not infer the project folder for you.
+You usually already know the absolute path from earlier actions (inspect_employee_files, read_employee_status, read_task_results — employees write absolute paths in their status reports). If you don't have the path, use \`inspect_employee_files\` first to locate the file.
+Set \`asPhoto: true\` for images you want rendered inline (jpg/png/gif/webp ≤10MB); otherwise the file is sent as a document (any type ≤50MB, preserves filename).
+These 6 actions are FORBIDDEN during proactive scans. ONLY use them when Bruce says "check file X", "look at the code", "what's in their .agents folder", etc.
 To understand employee work without reading files, use read_employee_status, read_employee_status_history, read_task_results, or ask_employee instead.
 
 RULES:
@@ -1307,6 +1322,7 @@ RULES:
       case 'read_employee_status_history': return `${a}:${action.employeeId}`;
       case 'read_task_results':            return `${a}:${action.employeeId}:${action.unread || false}`;
       case 'inspect_employee_files':       return `${a}:${action.employeeId}:${(action.task || '').substring(0, 80)}`;
+      case 'telegram_send_file':           return `${a}:${(action.path || '').substring(0, 120)}`;
       case 'mark_tasks_read':              return `${a}:${action.employeeId}`;
       case 'add_application':    return `${a}:${action.projectId}:${action.name}`;
       case 'remove_application': return `${a}:${action.projectId}:${action.name}`;
@@ -2061,6 +2077,40 @@ RULES:
         );
 
         return `🔧 Hands-on task started on ${pName}: "${action.task.substring(0, 100)}" (running in background)`;
+      }
+      case 'telegram_send_file': {
+        if (!action.path) throw new Error('path required');
+        if (typeof action.path !== 'string') throw new Error('path must be a string');
+        if (!path.isAbsolute(action.path)) {
+          throw new Error(`path must be an absolute path (got: "${action.path}"). Pass the full path like "D:/GrowthMaster/Repos/<Company>/.agents/comms/file.csv".`);
+        }
+        const absPath = path.resolve(action.path);
+        if (!fs.existsSync(absPath)) throw new Error(`File not found: ${absPath}`);
+        const stat = fs.statSync(absPath);
+        if (!stat.isFile()) throw new Error(`${absPath} is not a regular file`);
+
+        const filename = path.basename(absPath);
+        const asPhoto = !!action.asPhoto || TelegramService_isPhotoExt(filename);
+
+        const result = asPhoto
+          ? await telegramService.sendPhoto(absPath, action.caption)
+          : await telegramService.sendDocument(absPath, action.caption);
+
+        if (!result.ok) {
+          // sendPhoto can reject for size/format — fall back to sendDocument so Bruce still gets the file
+          if (asPhoto && !action.asPhoto) {
+            const docResult = await telegramService.sendDocument(absPath, action.caption);
+            if (docResult.ok) {
+              appendDailyLog(`📎 Sent ${filename} (as document, photo upload failed: ${result.error})`);
+              return `📎 Sent \`${filename}\` as document — photo upload failed: ${result.error}`;
+            }
+          }
+          throw new Error(result.error || 'Upload failed');
+        }
+
+        appendDailyLog(`📎 Sent ${filename} to Bruce (${absPath})`);
+        persistLog('action', `Sent ${filename} via Telegram`, { userId, metadata: { absPath } });
+        return `📎 Sent \`${filename}\` to you`;
       }
       default:
         throw new Error(`Unknown action: ${action.action}`);

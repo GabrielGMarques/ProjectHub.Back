@@ -175,6 +175,16 @@ export interface IProject extends Document {
   strategicCycle: IStrategicCycle;
   sortOrder: number;
   burndownSortOrder: number;
+  /** @deprecated Old project-meta Company record id. Kept for migration. Removed after phase 6. */
+  twentyCompanyId?: string;
+  /** Twenty `project` custom-object record this ProjectsHub project maps to (new model). */
+  twentyProjectId?: string;
+  /** Saved Twenty Views filtered to this project (re-created in phase 7). */
+  twentyPeopleViewId?: string;
+  twentyOpportunitiesViewId?: string;
+  twentyCompaniesViewId?: string;
+  twentyNotesViewId?: string;
+  twentyProvisionStatus?: 'pending' | 'provisioned' | 'failed';
   createdAt: Date;
   updatedAt: Date;
 }
@@ -304,6 +314,13 @@ const projectSchema = new Schema<IProject>(
     }],
     sortOrder: { type: Number, default: 0 },
     burndownSortOrder: { type: Number, default: -1 },
+    twentyCompanyId: { type: String, default: '' },
+    twentyProjectId: { type: String, default: '' },
+    twentyPeopleViewId: { type: String, default: '' },
+    twentyOpportunitiesViewId: { type: String, default: '' },
+    twentyCompaniesViewId: { type: String, default: '' },
+    twentyNotesViewId: { type: String, default: '' },
+    twentyProvisionStatus: { type: String, enum: ['pending', 'provisioned', 'failed'], default: undefined },
   },
   { timestamps: true }
 );

@@ -123,8 +123,7 @@ async function doQuery(opts: ProxyOptions): Promise<string> {
   delete sdkEnv.ANTHROPIC_API_KEY;
 
   const queryOpts: any = {
-    allowedTools: [],   // chat only, no tools
-    maxTurns: 1,        // single response
+    allowedTools: [],   // chat only, no tools — SDK can't loop
     env: sdkEnv,
   };
   if (opts.model) queryOpts.model = opts.model;

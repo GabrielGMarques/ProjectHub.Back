@@ -5,6 +5,10 @@
       "args": [
         "@playwright/mcp@latest"
       ]
+    },
+    "twenty": {
+      "type": "http",
+      "url": "http://localhost:3777/api/companies/69d8e15a012f5eea4f1b6337/twenty-mcp"
     }
   }
 }

@@ -1,5 +1,6 @@
 import { Project, IProject, IDocument } from '../models/project.model';
 import { DirectionHistory } from '../models/direction-history.model';
+import { twentyService } from './twenty.service';
 import { Types } from 'mongoose';
 import fs from 'fs';
 import path from 'path';
@@ -19,8 +20,15 @@ export class ProjectService {
     const project = new Project({
       ...data,
       userId: new Types.ObjectId(userId),
+      twentyProvisionStatus: 'pending',
     });
-    return project.save();
+    const saved = await project.save();
+    // Fire-and-forget: Twenty Company creation runs in the background (single GraphQL
+    // call, ~100ms). Project doc gets twentyCompanyId + status set when it completes.
+    twentyService.provisionTwentyProject(saved).catch(err =>
+      console.error(`[project.create] twenty provisioning crashed for ${saved.name}:`, err)
+    );
+    return saved;
   }
 
   async update(id: string, userId: string, data: Partial<IProject>): Promise<IProject | null> {

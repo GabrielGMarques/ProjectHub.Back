@@ -16,6 +16,7 @@ import { modelRoutingService } from './model-routing.service';
 import { employeeSessionService } from './employee-session.service';
 import os from 'os';
 import { firewallService } from './firewall.service';
+import { twentyService } from './twenty.service';
 
 const claudeCodeService = new ClaudeCodeService();
 const telegramService = telegramBot;
@@ -469,6 +470,13 @@ export class EmployeeService {
     const personalSkillsCtx = this.buildPersonalSkillsContext(employee, cwd);
     const memoryCtx = await employeeMemoryService.buildMemoryContext(employee._id.toString(), 7);
 
+    // Twenty CRM context — if this project has been provisioned with a Twenty Company,
+    // tell the employee to scope all CRM ops to it. The `twenty` MCP server is wired in
+    // via mcpServers below; auth is via the shared admin key in env.
+    const twentyCtx = project.twentyCompanyId && twentyService.getAdminApiKey()
+      ? `\nCRM (Twenty) CONTEXT:\nThis project maps to Twenty Company ID: ${project.twentyCompanyId}\nWhen creating People, Notes, Tasks, or Opportunities in Twenty via the \`twenty\` MCP server, set their \`company\` (or \`companyId\`) field to this exact ID. This is how data stays scoped to this project.\nDiscovery: start with mcp__twenty__get_tool_catalog, then mcp__twenty__learn_tools, then mcp__twenty__execute_tool. Never guess tool names.\n`
+      : '';
+
     // Fetch recent working status history so employee can pick up context without resuming old sessions
     const recentStatuses = await WorkingStatusHistory.find({ employeeId: employee._id })
       .sort({ createdAt: -1 })
@@ -851,6 +859,7 @@ If you see that error: mark each pending task done (or failed) first, then dismi
 ═══════════════════════════════════════════════════════════════════
 
 ${skillsCtx}
+${twentyCtx}
 ${personalSkillsCtx}
 PERSONAL SKILLS — YOUR SELF-LEARNING SYSTEM:
 You have a personal skills directory where you can save behaviors, patterns, and knowledge
@@ -989,7 +998,7 @@ Only use this for genuinely complex problems. Your session will restart with the
         empLog(userId, eId, pId, 'tool_result', resultText.substring(0, 500), empInfo, pName);
         // Auto-detect permission blocks — validate & fix config, then notify
         if (resultText.includes('requires approval') || resultText.includes('contains multiple operations')) {
-          const check = this.validateClaudeConfig(cwd);
+          const check = this.validateClaudeConfig(cwd, project);
           const fixStatus = check.fixed ? 'config was mismatched and has been fixed' : 'config was already correct (SDK needs restart)';
           empLog(userId, eId, pId, 'error', `⚠️ Permission block detected — ${fixStatus}. Issues: ${check.issues.join('; ') || 'none'}`, empInfo, pName);
           telegramBot.send(`⚠️ *${employee.name}* is blocked by permissions on _${pName}_. Config ${check.fixed ? 'fixed' : 'OK'} — restart employee to apply: tell Alfred "restart ${employee.name}"`).catch(() => {});
@@ -1048,7 +1057,7 @@ Only use this for genuinely complex problems. Your session will restart with the
         const isRetry = attempt > 1;
 
         // Validate .claude config matches reference before every execution attempt
-        const configCheck = this.validateClaudeConfig(cwd);
+        const configCheck = this.validateClaudeConfig(cwd, project);
         if (!configCheck.valid) {
           const fixMsg = configCheck.fixed ? ' (auto-fixed)' : '';
           empLog(userId, eId, pId, 'text',
@@ -1074,21 +1083,34 @@ Only use this for genuinely complex problems. Your session will restart with the
           // Write Playwright storage state with project-scoped cookies + blocked origins
           const pwState = await this.writePlaywrightState(employee, project);
 
+          // Route Twenty MCP through ProjectsHub's enforcement proxy so cross-company
+          // writes get rejected and missing company FKs are auto-injected. The proxy
+          // attaches the admin API key server-side; employees never see the raw key.
+          const backendBase = process.env.PROJECTSHUB_BACKEND_URL || 'http://localhost:3777';
+          const twentyUrl = process.env.TWENTY_MCP_URL || `${backendBase}/api/companies/${project._id}/twenty-mcp`;
+          const mcpServers: Record<string, any> = {
+            playwright: {
+              command: 'npx',
+              args: [
+                '@playwright/mcp@latest',
+                '--storage-state', pwState.statePath,
+                '--blocked-origins', pwState.blockedOrigins,
+              ],
+            },
+          };
+          if (project.twentyCompanyId) {
+            mcpServers.twenty = {
+              type: 'http',
+              url: twentyUrl,
+              headers: { 'X-Employee-Id': String(employee._id) },
+            };
+          }
           const result = await claudeCodeService.runCommand(cwd, currentPrompt, eventHandler, {
             allowedTools: SDK_ALLOWED_TOOLS,
             // No resumeSdkSessionId — always fresh session to avoid 20M+ cache costs
             keepAlive: true,
             model: resolvedModel,
-            mcpServers: {
-              playwright: {
-                command: 'npx',
-                args: [
-                  '@playwright/mcp@latest',
-                  '--storage-state', pwState.statePath,
-                  '--blocked-origins', pwState.blockedOrigins,
-                ],
-              },
-            },
+            mcpServers,
             shouldContinue: async () => {
               // Never auto-resurrect. The agent decides when it's done by calling
               // /self/dismiss explicitly. Forcing continuation produced "looking for
@@ -1531,7 +1553,8 @@ INSTRUCTIONS:
     }
 
     // Level 1-2: Auto-provision .claude/settings.local.json with permission allowlist
-    this.ensureClaudeSettings(cwd);
+    // Pass project so the Twenty MCP server entry can be injected when twentyApiKey is set.
+    this.ensureClaudeSettings(cwd, project);
 
     // Level 3: Auto-provision helper scripts
     this.ensureWriteFileHelper(cwd);
@@ -1598,7 +1621,7 @@ INSTRUCTIONS:
   }
 
   /** Level 1-2: Create/update .claude/settings.local.json in the project cwd so agents can run without permission blocks */
-  private ensureClaudeSettings(cwd: string): void {
+  private ensureClaudeSettings(cwd: string, project?: { _id?: any; twentyCompanyId?: string }): void {
     const claudeDir = path.join(cwd, '.claude');
     const settingsFile = path.join(claudeDir, 'settings.local.json');
 
@@ -1609,26 +1632,36 @@ INSTRUCTIONS:
     // Always overwrite with the reference config to ensure consistency
     fs.writeFileSync(settingsFile, JSON.stringify(REFERENCE_SETTINGS_LOCAL, null, 2), 'utf-8');
 
-    // Ensure .mcp.json exists at project root with Playwright MCP server
+    // .mcp.json: always include Playwright; conditionally include Twenty CRM if the
+    // project has a provisioned Twenty Company. Twenty access goes through our proxy
+    // (per-project enforcement); the proxy attaches the admin key server-side.
     const mcpFile = path.join(cwd, '.mcp.json');
-    const mcpConfig = {
-      mcpServers: {
-        playwright: {
-          command: 'npx',
-          args: ['@playwright/mcp@latest'],
-        },
+    const backendBase = process.env.PROJECTSHUB_BACKEND_URL || 'http://localhost:3777';
+    const twentyUrl = project?._id
+      ? (process.env.TWENTY_MCP_URL || `${backendBase}/api/companies/${project._id}/twenty-mcp`)
+      : null;
+    const desired: Record<string, any> = {
+      playwright: {
+        command: 'npx',
+        args: ['@playwright/mcp@latest'],
       },
     };
+    if (twentyUrl && project?.twentyCompanyId) {
+      desired.twenty = {
+        type: 'http',
+        url: twentyUrl,
+      };
+    }
     try {
+      let merged: any = { mcpServers: desired };
       if (fs.existsSync(mcpFile)) {
         const existing = JSON.parse(fs.readFileSync(mcpFile, 'utf-8'));
-        if (!existing.mcpServers?.playwright) {
-          existing.mcpServers = { ...existing.mcpServers, ...mcpConfig.mcpServers };
-          fs.writeFileSync(mcpFile, JSON.stringify(existing, null, 2), 'utf-8');
-        }
-      } else {
-        fs.writeFileSync(mcpFile, JSON.stringify(mcpConfig, null, 2), 'utf-8');
+        merged = {
+          ...existing,
+          mcpServers: { ...(existing.mcpServers || {}), ...desired },
+        };
       }
+      fs.writeFileSync(mcpFile, JSON.stringify(merged, null, 2), 'utf-8');
     } catch { /* ignore — non-critical */ }
 
     // Also ensure the project is trusted in ~/.claude.json
@@ -1762,7 +1795,7 @@ INSTRUCTIONS:
     return { statePath: statePath.replace(/\\/g, '/'), blockedOrigins };
   }
 
-  private validateClaudeConfig(cwd: string): { valid: boolean; issues: string[]; fixed: boolean } {
+  private validateClaudeConfig(cwd: string, project?: { twentyCompanyId?: string }): { valid: boolean; issues: string[]; fixed: boolean } {
     const issues: string[] = [];
     let fixed = false;
     const normalizedCwd = cwd.replace(/\\/g, '/');
@@ -1816,7 +1849,7 @@ INSTRUCTIONS:
     // 3. Auto-fix if any issues found
     if (issues.length > 0) {
       console.warn(`[ClaudeConfig] Config mismatch for ${normalizedCwd}: ${issues.join('; ')} — auto-fixing`);
-      this.ensureClaudeSettings(cwd);
+      this.ensureClaudeSettings(cwd, project);
       fixed = true;
     }
 

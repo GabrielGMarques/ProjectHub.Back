@@ -7,6 +7,8 @@ import { exec } from 'child_process';
 import { AuthRequest } from '../middleware/auth.middleware';
 import { ProjectService } from '../services/project.service';
 import { AIService, AIModel } from '../services/ai.service';
+import { twentyService } from '../services/twenty.service';
+import { twentyMcpProxyService } from '../services/twenty-mcp-proxy.service';
 
 const projectService = new ProjectService();
 const aiService = new AIService();
@@ -502,6 +504,93 @@ export class ProjectController {
       res.json({ message: 'Coach messages cleared' });
     } catch (error) {
       res.status(500).json({ error: 'Failed to clear coach messages' });
+    }
+  }
+
+  /**
+   * MCP proxy: AI employees POST JSON-RPC here instead of directly to Twenty.
+   * Enforces per-project Company scoping (see twenty-mcp-proxy.service.ts).
+   * No auth middleware — employees authenticate via the Twenty admin key which
+   * the proxy attaches server-side. Access control is via project ID in the URL
+   * + optional X-Employee-Id header for audit attribution.
+   */
+  async twentyMcpProxy(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const projectId = req.params.id;
+      const employeeId = (req.header('X-Employee-Id') || '').trim() || null;
+      const inboundHeaders: Record<string, string> = {};
+      for (const [k, v] of Object.entries(req.headers)) {
+        if (typeof v === 'string') inboundHeaders[k.toLowerCase()] = v;
+      }
+      const result = await twentyMcpProxyService.proxy(projectId, employeeId, req.body, inboundHeaders);
+
+      if (result.audit) {
+        const tag = result.audit.action === 'reject' ? '[twenty-proxy:REJECT]'
+          : result.audit.action === 'inject' ? '[twenty-proxy:inject]'
+          : '[twenty-proxy]';
+        const empPart = employeeId ? ` emp=${employeeId}` : '';
+        const reason = result.audit.reason ? ` (${result.audit.reason})` : '';
+        console.log(`${tag} proj=${projectId}${empPart} tool=${result.audit.toolName}${reason}`);
+      }
+
+      res.status(result.status).type(result.contentType).send(result.body);
+    } catch (error: any) {
+      res.status(502).json({
+        jsonrpc: '2.0',
+        id: req.body?.id ?? null,
+        error: { code: -32603, message: `proxy error: ${error.message || error}` },
+      });
+    }
+  }
+
+  /** Returns Companies/People/Opportunities linked to this project (via Twenty `projectId`). */
+  async getCrm(req: AuthRequest, res: Response): Promise<void> {
+    try {
+      const project = await projectService.findById(req.params.id, req.userId!);
+      if (!project) { res.status(404).json({ error: 'Project not found' }); return; }
+      if (!project.twentyProjectId) {
+        res.json({ linked: false, status: project.twentyProvisionStatus || null });
+        return;
+      }
+      const [twentyProject, companies, people, opportunities, rawNotes] = await Promise.all([
+        twentyService.getProject(project.twentyProjectId).catch(() => null),
+        twentyService.listCompaniesByProject(project.twentyProjectId).catch(() => []),
+        twentyService.listPeopleByProject(project.twentyProjectId).catch(() => []),
+        twentyService.listOpportunitiesByProject(project.twentyProjectId).catch(() => []),
+        twentyService.listNotesByProject(project.twentyProjectId).catch(() => []),
+      ]);
+
+      // Enrich notes with the linked Company name(s) by resolving noteTarget.targetCompanyId
+      // against the companies we already fetched for this project.
+      const companyById = new Map<string, string>();
+      for (const c of companies) companyById.set(c.id, c.name);
+      const notes = rawNotes.map((n: any) => {
+        const linkedCompanies = (n.noteTargets || [])
+          .map((nt: any) => nt.targetCompanyId)
+          .filter((id: string) => id && companyById.has(id))
+          .map((id: string) => ({ id, name: companyById.get(id) }));
+        return { ...n, linkedCompanies };
+      });
+      res.json({
+        linked: true,
+        projectId: project.twentyProjectId,
+        deepLink: twentyService.getProjectDeepLink(project.twentyProjectId),
+        companiesViewLink: project.twentyCompaniesViewId
+          ? twentyService.getViewDeepLink('company', project.twentyCompaniesViewId) : null,
+        peopleViewLink: project.twentyPeopleViewId
+          ? twentyService.getViewDeepLink('person', project.twentyPeopleViewId) : null,
+        opportunitiesViewLink: project.twentyOpportunitiesViewId
+          ? twentyService.getViewDeepLink('opportunity', project.twentyOpportunitiesViewId) : null,
+        notesViewLink: project.twentyNotesViewId
+          ? twentyService.getViewDeepLink('note', project.twentyNotesViewId) : null,
+        twentyProject,
+        companies,
+        people,
+        opportunities,
+        notes,
+      });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message || 'Failed to fetch CRM data' });
     }
   }
 }

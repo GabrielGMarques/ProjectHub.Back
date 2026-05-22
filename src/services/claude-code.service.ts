@@ -129,7 +129,6 @@ export class ClaudeCodeService {
     const baseOptions: any = {
       allowedTools: options?.allowedTools?.length ? options.allowedTools : ['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', 'WebSearch'],
       cwd: resolvedPath,
-      maxTurns: 3000,
       env: sdkEnv,
     };
     if (options?.model) baseOptions.model = options.model;

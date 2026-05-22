@@ -32,6 +32,7 @@
     "passport": "^0.7.0",
     "passport-github2": "^0.1.12",
     "pdf-parse": "^2.2.2",
+    "playwright": "^1.60.0",
     "socket.io": "^4.8.3"
   },
   "devDependencies": {

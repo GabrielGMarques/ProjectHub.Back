@@ -142,11 +142,22 @@ async function seed(): Promise<void> {
       console.log('No GitHub user found. Using seed user. Log in with GitHub first for best results.');
     }
 
-    // Remove old seeded projects and re-seed
+    // SAFETY: never wipe existing projects unless explicitly forced.
+    // This script used to deleteMany() unconditionally — that destroyed real work
+    // (folder links, applications, todos, employee histories) when re-run on a
+    // populated DB. The Micro Company AI Tech Consultancy incident on 2026-04-10
+    // happened this way. Now: skip seeding entirely if any project exists, and
+    // require SEED_FORCE_WIPE=1 to opt back into the destructive path.
     const existing = await Project.countDocuments({ userId: user._id });
+    if (existing > 0 && process.env.SEED_FORCE_WIPE !== '1') {
+      console.log(`Refusing to seed: ${existing} project(s) already exist for ${user.username}.`);
+      console.log('Set SEED_FORCE_WIPE=1 to wipe and re-seed (DESTRUCTIVE — loses folders/employees/apps/todos).');
+      await mongoose.disconnect();
+      return;
+    }
     if (existing > 0) {
       await Project.deleteMany({ userId: user._id });
-      console.log(`Cleared ${existing} existing projects for user ${user.username}.`);
+      console.log(`⚠ Cleared ${existing} existing projects (SEED_FORCE_WIPE=1).`);
     }
 
     const projects = seedProjects.map((p) => ({ ...p, userId: user!._id }));

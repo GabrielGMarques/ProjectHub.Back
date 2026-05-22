@@ -1,5 +1,5 @@
 <!-- AUTO-GENERATED:START — managed by ProjectsHub obsidian-sync -->
-<!-- Last sync: 2026-05-05T16:07:27.418Z -->
+<!-- Last sync: 2026-05-18T21:19:31.564Z -->
 
 # Finance Automation for Isabelli `1b6337`
 
@@ -15,11 +15,11 @@ Plataforma automatizada de análise e reconciliação financeira para microempre
 | Employee | ID | Role | Status | Last Activity |
 |----------|----|----|--------|---------------|
 | 📋 Product Manager | `89b9b7` | product-manager | idle | 2026-05-05 |
-| 🏛️ Chief Executive Officer | `e5fcb3` | ceo | idle | 2026-04-08 |
-| 🔧 Full Stack Developer | `db5646` | fullstack-developer | idle | 2026-04-21 |
+| 🏛️ Chief Executive Officer | `e5fcb3` | ceo | idle | 2026-05-12 |
+| 🔧 Full Stack Developer | `db5646` | fullstack-developer | idle | 2026-05-14 |
 | 👔 Chief Technology Officer | `a37101` | cto | idle | 2026-04-08 |
-| 🏗️ Infrastructure Administrator | `f7a8b8` | infra-administrator | idle | 2026-05-05 |
-| 📢 Marketing Specialist | `cc0b15` | marketing-specialist | idle | 2026-05-05 |
+| 🏗️ Infrastructure Administrator | `f7a8b8` | infra-administrator | idle | 2026-05-12 |
+| 📢 Marketing Specialist | `cc0b15` | marketing-specialist | idle | 2026-05-18 |
 
 ## Public Gateway Rules
 

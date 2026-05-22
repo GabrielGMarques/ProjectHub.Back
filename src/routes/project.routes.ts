@@ -14,6 +14,11 @@ const marketingController = new MarketingResearchController();
 const claudeCodeController = new ClaudeCodeController();
 const infraController = new InfrastructureController();
 
+// --- UNAUTHENTICATED: Twenty MCP proxy used by AI employee processes ---
+// Same pattern as /self/* employee endpoints — requester is trusted local code.
+// Per-project scope is enforced by the proxy itself (companyId injection/reject).
+router.post('/:id/twenty-mcp', (req: any, res: any) => controller.twentyMcpProxy(req, res));
+
 router.use(authMiddleware);
 
 router.get('/', (req, res) => controller.getAll(req, res));
@@ -46,6 +51,9 @@ router.post('/:id/files/open-in-explorer', (req: any, res: any) => controller.op
 router.post('/:id/documents', upload.single('file'), (req: any, res: any) => controller.uploadDocument(req, res));
 router.get('/:id/documents/:docId/download', (req: any, res: any) => controller.downloadDocument(req, res));
 router.delete('/:id/documents/:docId', (req: any, res: any) => controller.deleteDocument(req, res));
+
+// CRM (Twenty) data for the project's CRM tab
+router.get('/:id/crm', (req: any, res: any) => controller.getCrm(req, res));
 
 // AI coaching
 router.post('/:id/ai/coach', (req: any, res: any) => controller.aiCoach(req, res));

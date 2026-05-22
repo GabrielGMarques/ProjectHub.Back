@@ -748,6 +748,146 @@ export class TelegramService {
     });
   }
 
+  // ── File uploads ──
+  // Telegram bot API limits: sendDocument 50MB, sendPhoto 10MB.
+  private static readonly DOC_MAX_BYTES = 50 * 1024 * 1024;
+  private static readonly PHOTO_MAX_BYTES = 10 * 1024 * 1024;
+
+  /** Send a file as a document (preserves filename, no preview). Returns ok + optional error. */
+  async sendDocument(
+    filePath: string,
+    caption?: string,
+  ): Promise<{ ok: boolean; error?: string }> {
+    return this.uploadFile('sendDocument', 'document', filePath, caption, TelegramService.DOC_MAX_BYTES);
+  }
+
+  /** Send an image inline (Telegram renders it). For non-image files, use sendDocument. */
+  async sendPhoto(
+    filePath: string,
+    caption?: string,
+  ): Promise<{ ok: boolean; error?: string }> {
+    return this.uploadFile('sendPhoto', 'photo', filePath, caption, TelegramService.PHOTO_MAX_BYTES);
+  }
+
+  private async uploadFile(
+    method: 'sendDocument' | 'sendPhoto',
+    fieldName: 'document' | 'photo',
+    filePath: string,
+    caption: string | undefined,
+    maxBytes: number,
+  ): Promise<{ ok: boolean; error?: string }> {
+    if (!this.botToken || !this.chatId) return { ok: false, error: 'Telegram not configured' };
+    if (!fs.existsSync(filePath)) return { ok: false, error: `File not found: ${filePath}` };
+
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) return { ok: false, error: `Not a file: ${filePath}` };
+    if (stat.size === 0) return { ok: false, error: 'File is empty' };
+    if (stat.size > maxBytes) {
+      return { ok: false, error: `File too large (${(stat.size / 1024 / 1024).toFixed(1)}MB > ${maxBytes / 1024 / 1024}MB limit)` };
+    }
+
+    const fileBuf = fs.readFileSync(filePath);
+    const filename = path.basename(filePath);
+    const mimeType = TelegramService.guessMimeType(filename);
+
+    const textFields: Record<string, string> = { chat_id: this.chatId };
+    if (caption) {
+      textFields.caption = TelegramService.toTelegramMarkdown(caption).substring(0, 1024);
+      textFields.parse_mode = 'Markdown';
+    }
+
+    const result = await this.apiUploadMultipart(method, textFields, {
+      field: fieldName,
+      filename,
+      mimeType,
+      data: fileBuf,
+    });
+
+    if (!result.ok && caption && result.description?.toLowerCase().includes('parse')) {
+      // Retry without Markdown if caption parsing failed
+      delete textFields.parse_mode;
+      textFields.caption = TelegramService.stripMarkdown(textFields.caption);
+      const retry = await this.apiUploadMultipart(method, textFields, {
+        field: fieldName, filename, mimeType, data: fileBuf,
+      });
+      return { ok: retry.ok, error: retry.ok ? undefined : retry.description };
+    }
+    return { ok: result.ok, error: result.ok ? undefined : result.description };
+  }
+
+  private static guessMimeType(filename: string): string {
+    const ext = path.extname(filename).toLowerCase();
+    const map: Record<string, string> = {
+      '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+      '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
+      '.pdf': 'application/pdf', '.zip': 'application/zip',
+      '.json': 'application/json', '.txt': 'text/plain', '.md': 'text/markdown',
+      '.html': 'text/html', '.csv': 'text/csv',
+      '.mp4': 'video/mp4', '.mov': 'video/quicktime',
+      '.mp3': 'audio/mpeg', '.wav': 'audio/wav',
+    };
+    return map[ext] || 'application/octet-stream';
+  }
+
+  private apiUploadMultipart(
+    method: string,
+    textFields: Record<string, string>,
+    file: { field: string; filename: string; mimeType: string; data: Buffer },
+  ): Promise<{ ok: boolean; errorCode?: number; description?: string }> {
+    const boundary = `----TelegramBoundary${Date.now().toString(16)}${Math.random().toString(16).slice(2)}`;
+    const CRLF = '\r\n';
+    const parts: Buffer[] = [];
+
+    for (const [name, value] of Object.entries(textFields)) {
+      parts.push(Buffer.from(
+        `--${boundary}${CRLF}` +
+        `Content-Disposition: form-data; name="${name}"${CRLF}${CRLF}` +
+        `${value}${CRLF}`,
+      ));
+    }
+    // Filename must be ASCII-safe; replace anything weird with underscore
+    const safeName = file.filename.replace(/[^\w.\-]+/g, '_');
+    parts.push(Buffer.from(
+      `--${boundary}${CRLF}` +
+      `Content-Disposition: form-data; name="${file.field}"; filename="${safeName}"${CRLF}` +
+      `Content-Type: ${file.mimeType}${CRLF}${CRLF}`,
+    ));
+    parts.push(file.data);
+    parts.push(Buffer.from(`${CRLF}--${boundary}--${CRLF}`));
+
+    const body = Buffer.concat(parts);
+
+    return new Promise((resolve) => {
+      const req = https.request({
+        hostname: 'api.telegram.org',
+        path: `/bot${this.botToken}/${method}`,
+        method: 'POST',
+        headers: {
+          'Content-Type': `multipart/form-data; boundary=${boundary}`,
+          'Content-Length': body.length,
+        },
+      }, (res) => {
+        let data = '';
+        res.on('data', (chunk) => (data += chunk));
+        res.on('end', () => {
+          if (res.statusCode === 200) {
+            resolve({ ok: true });
+          } else {
+            try {
+              const parsed = JSON.parse(data);
+              resolve({ ok: false, errorCode: parsed.error_code, description: parsed.description });
+            } catch {
+              resolve({ ok: false, errorCode: res.statusCode, description: data.substring(0, 200) });
+            }
+          }
+        });
+      });
+      req.on('error', (err) => resolve({ ok: false, errorCode: 0, description: err.message }));
+      req.write(body);
+      req.end();
+    });
+  }
+
   private apiCall(method: string, body: any): Promise<boolean> {
     return this.apiCallWithResponse(method, body).then(r => r.ok);
   }
